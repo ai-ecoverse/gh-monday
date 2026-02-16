@@ -10,7 +10,10 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 WHITE='\033[0;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m' # No Color
 
 # Runtime configuration
@@ -19,8 +22,6 @@ GH_REAL_BIN="${GH_REAL_BIN:-/opt/homebrew/bin/gh}"
 LIMIT="${GH_MONDAY_LIMIT:-120}"
 ROOTS="${GH_MONDAY_ROOTS:-}"
 FETCH="${GH_MONDAY_FETCH:-false}"
-SHOW_GLOBAL=true
-SHOW_MENTIONS=true
 JOBS="${GH_MONDAY_JOBS:-8}"
 USE_REPO_CACHE=true
 REPO_CACHE_TTL="${GH_MONDAY_REPO_CACHE_TTL:-21600}"
@@ -28,6 +29,10 @@ FIND_MAX_DEPTH="${GH_MONDAY_MAX_DEPTH:-6}"
 LOOKBACK_DAYS="${GH_MONDAY_DAYS:-7}"
 STALE_DAYS="${GH_MONDAY_STALE_DAYS:-30}"
 RESET_WEEK_CACHE=false
+LAST_ACTOR_CACHE_TTL="${GH_MONDAY_ACTOR_CACHE_TTL:-3600}"
+
+# Current user (will be populated)
+MY_USERNAME=""
 
 # Computed time window
 NOW_EPOCH=0
@@ -37,19 +42,19 @@ WEEK_FIRST_RUN_EPOCH=0
 WEEK_FIRST_RUN_IS_NEW=false
 WEEK_KEY=""
 
-# Temp files
+# Temp files for data collection
 LOCAL_REPOS_FILE=""
-BEHIND_FILE=""
-BEHIND_RAW_FILE=""
-REVIEWS_FILE=""
-MENTIONS_FILE=""
-STALE_FILE=""
+REPO_STATE_FILE=""
+GITHUB_ITEMS_FILE=""
+ENRICHED_ITEMS_FILE=""
+SCORED_ITEMS_FILE=""
 
-# Cache files
+# Cache directories
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gh-monday"
 CACHE_REPOS_FILE="$CACHE_DIR/local-repos.tsv"
 CACHE_ROOTS_FILE="$CACHE_DIR/local-repos.roots"
 CACHE_WEEKLY_FILE="$CACHE_DIR/weekly-first-run.tsv"
+CACHE_ACTOR_DIR="$CACHE_DIR/last-actor"
 
 cache_key() {
     printf '%s|%s\n' "$ROOTS" "$FIND_MAX_DEPTH"
@@ -80,7 +85,7 @@ command_exists() {
 }
 
 cleanup() {
-    rm -f "$LOCAL_REPOS_FILE" "$BEHIND_FILE" "$BEHIND_RAW_FILE" "$REVIEWS_FILE" "$MENTIONS_FILE" "$STALE_FILE"
+    rm -f "$LOCAL_REPOS_FILE" "$REPO_STATE_FILE" "$GITHUB_ITEMS_FILE" "$ENRICHED_ITEMS_FILE" "$SCORED_ITEMS_FILE"
 }
 
 resolve_gh_binary() {
@@ -256,18 +261,21 @@ usage() {
     cat <<'EOF'
 Usage: gh monday [options]
 
-A local-first Monday morning triage view:
-  1. Local repositories behind upstream
-  2. Review requests in local repositories
-  3. Mentions in local repositories
-  4. Filtered global activity snapshot
+Ranked GitHub triage - shows what needs your attention, prioritized by:
+  - Items waiting on you (someone else acted last)
+  - Your local repositories (work you're actively doing)
+  - Your role (author > reviewer > mentioned)
+  - Recency of activity
+
+Output sections:
+  🔴 ACTION NEEDED    - PRs/issues where ball is in your court
+  🟡 WAITING ON OTHERS - Your work waiting on someone else
+  🗑️  CLEANUP CANDIDATES - Stale local repos with no open GitHub work
 
 Options:
   --fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
   --no-fetch      Do not fetch remotes before behind/ahead checks
-  --no-global     Skip the final global activity section
-  --no-mentions   Skip the mentions section
-  --jobs N        Parallelism for local repo checks (default: 8)
+  --jobs N        Parallelism for checks (default: 8)
   --max-depth N   Max directory depth when scanning for local repos (default: 6)
   --days N        Rolling lookback window in days for activity (default: 7)
   --stale-days N  Suggest cleanup for local repos untouched for N days (default: 30)
@@ -284,11 +292,12 @@ Environment:
   GH_MONDAY_ROOTS   Default roots (same format as --roots)
   GH_MONDAY_LIMIT   Default limit (same as --limit)
   GH_MONDAY_FETCH   true/false default fetch behavior (default: false)
-  GH_MONDAY_JOBS    Parallel workers for local repo checks (default: 8)
+  GH_MONDAY_JOBS    Parallel workers (default: 8)
   GH_MONDAY_MAX_DEPTH  Max scan depth for repo discovery (default: 6)
   GH_MONDAY_DAYS    Rolling lookback window in days (default: 7)
   GH_MONDAY_STALE_DAYS  Stale repo threshold in days (default: 30)
   GH_MONDAY_REPO_CACHE_TTL  Repo cache TTL in seconds (default: 21600)
+  GH_MONDAY_ACTOR_CACHE_TTL  Last-actor cache TTL in seconds (default: 3600)
   GH_MONDAY_DEBUG   Set to true for debug output
 EOF
 }
@@ -296,6 +305,340 @@ EOF
 repo_is_local() {
     local repo="$1"
     grep -Fq "$(printf '%s\t' "$repo")" "$LOCAL_REPOS_FILE"
+}
+
+get_local_path() {
+    local repo="$1"
+    awk -F '\t' -v r="$repo" '$1 == r {print $2; exit}' "$LOCAL_REPOS_FILE"
+}
+
+get_my_username() {
+    "$GH_REAL_BIN" api user --jq '.login' 2>/dev/null || echo ""
+}
+
+# Fetch all GitHub items involving the user
+# Output format: type|repo|number|title|url|author|updated_at|is_draft|my_role
+fetch_github_items() {
+    local prs_authored prs_review_requested prs_assigned issues_involving
+    local tmp_prs tmp_issues
+
+    tmp_prs="$(mktemp)"
+    tmp_issues="$(mktemp)"
+
+    print_debug "Fetching PRs authored by me..."
+    prs_authored="$("$GH_REAL_BIN" search prs \
+        --author=@me \
+        --state=open \
+        --limit "$LIMIT" \
+        --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
+
+    print_debug "Fetching PRs where review requested..."
+    prs_review_requested="$("$GH_REAL_BIN" search prs \
+        --review-requested=@me \
+        --state=open \
+        --limit "$LIMIT" \
+        --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
+
+    print_debug "Fetching PRs assigned to me..."
+    prs_assigned="$("$GH_REAL_BIN" search prs \
+        --assignee=@me \
+        --state=open \
+        --limit "$LIMIT" \
+        --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
+
+    print_debug "Fetching issues involving me..."
+    issues_involving="$("$GH_REAL_BIN" search issues \
+        --involves=@me \
+        --state=open \
+        --limit "$LIMIT" \
+        --json repository,number,title,url,author,updatedAt 2>/dev/null || echo "[]")"
+
+    # Process PRs - determine role for each
+    # Priority: author > reviewer > assignee
+    # Filter by activity window cutoff
+    printf '%s' "$prs_authored" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
+        .[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+            "pr",
+            .repository.nameWithOwner,
+            .number,
+            .title,
+            .url,
+            .author.login,
+            .updatedAt,
+            (if .isDraft then "true" else "false" end),
+            "author"
+        ] | @tsv
+    ' >> "$tmp_prs" 2>/dev/null || true
+
+    printf '%s' "$prs_review_requested" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
+        .[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+            "pr",
+            .repository.nameWithOwner,
+            .number,
+            .title,
+            .url,
+            .author.login,
+            .updatedAt,
+            (if .isDraft then "true" else "false" end),
+            "reviewer"
+        ] | @tsv
+    ' >> "$tmp_prs" 2>/dev/null || true
+
+    printf '%s' "$prs_assigned" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
+        .[] | select(.author.login != $me) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+            "pr",
+            .repository.nameWithOwner,
+            .number,
+            .title,
+            .url,
+            .author.login,
+            .updatedAt,
+            (if .isDraft then "true" else "false" end),
+            "assignee"
+        ] | @tsv
+    ' >> "$tmp_prs" 2>/dev/null || true
+
+    # Process issues - filter by activity window
+    printf '%s' "$issues_involving" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
+        .[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+            "issue",
+            .repository.nameWithOwner,
+            .number,
+            .title,
+            .url,
+            .author.login,
+            .updatedAt,
+            "false",
+            (if .author.login == $me then "author" else "involved" end)
+        ] | @tsv
+    ' >> "$tmp_issues" 2>/dev/null || true
+
+    # Deduplicate by repo+number, keeping highest priority role
+    # Role priority: author=1, reviewer=2, assignee=3, involved=4
+    cat "$tmp_prs" "$tmp_issues" | awk -F '\t' '
+    BEGIN { OFS="\t" }
+    {
+        key = $1 "|" $2 "|" $3
+        role = $9
+        role_priority = (role == "author" ? 1 : (role == "reviewer" ? 2 : (role == "assignee" ? 3 : 4)))
+        if (!(key in seen) || role_priority < seen_priority[key]) {
+            seen[key] = $0
+            seen_priority[key] = role_priority
+        }
+    }
+    END {
+        for (key in seen) print seen[key]
+    }
+    ' | sort -t $'\t' -k7,7r  # Sort by updatedAt descending
+
+    rm -f "$tmp_prs" "$tmp_issues"
+}
+
+# Get last actor for a PR or issue (with caching)
+# Args: type repo number updated_at
+# Output: last_actor_login|last_actor_timestamp
+get_last_actor() {
+    local item_type="$1"
+    local repo="$2"
+    local number="$3"
+    local updated_at="$4"
+
+    local cache_dir="$CACHE_ACTOR_DIR/${repo//\//_}"
+    local cache_file="$cache_dir/${item_type}_${number}.json"
+    local cache_updated cached_actor cached_at
+
+    mkdir -p "$cache_dir"
+
+    # Check cache
+    if [ -f "$cache_file" ]; then
+        cache_updated="$(jq -r '.updated_at // ""' "$cache_file" 2>/dev/null || true)"
+        if [ "$cache_updated" = "$updated_at" ]; then
+            cached_actor="$(jq -r '.last_actor // ""' "$cache_file" 2>/dev/null || true)"
+            cached_at="$(jq -r '.last_at // ""' "$cache_file" 2>/dev/null || true)"
+            if [ -n "$cached_actor" ]; then
+                printf '%s\t%s\n' "$cached_actor" "$cached_at"
+                return 0
+            fi
+        fi
+    fi
+
+    # Fetch from API
+    local last_actor="" last_at=""
+
+    if [ "$item_type" = "pr" ]; then
+        # For PRs, check both comments and reviews, get most recent
+        local comments_data reviews_data
+
+        comments_data="$("$GH_REAL_BIN" api "repos/$repo/issues/$number/comments" \
+            --jq 'if length > 0 then .[-1] | {actor: .user.login, at: .created_at} else {actor: "", at: ""} end' 2>/dev/null || echo '{}')"
+
+        reviews_data="$("$GH_REAL_BIN" api "repos/$repo/pulls/$number/reviews" \
+            --jq 'if length > 0 then .[-1] | {actor: .user.login, at: .submitted_at} else {actor: "", at: ""} end' 2>/dev/null || echo '{}')"
+
+        # Compare timestamps to find most recent
+        local comment_actor comment_at review_actor review_at
+        comment_actor="$(printf '%s' "$comments_data" | jq -r '.actor // ""')"
+        comment_at="$(printf '%s' "$comments_data" | jq -r '.at // ""')"
+        review_actor="$(printf '%s' "$reviews_data" | jq -r '.actor // ""')"
+        review_at="$(printf '%s' "$reviews_data" | jq -r '.at // ""')"
+
+        if [ -n "$comment_at" ] && [ -n "$review_at" ]; then
+            if [[ "$comment_at" > "$review_at" ]]; then
+                last_actor="$comment_actor"
+                last_at="$comment_at"
+            else
+                last_actor="$review_actor"
+                last_at="$review_at"
+            fi
+        elif [ -n "$comment_at" ]; then
+            last_actor="$comment_actor"
+            last_at="$comment_at"
+        elif [ -n "$review_at" ]; then
+            last_actor="$review_actor"
+            last_at="$review_at"
+        fi
+    else
+        # For issues, just check comments
+        local comments_data
+        comments_data="$("$GH_REAL_BIN" api "repos/$repo/issues/$number/comments" \
+            --jq 'if length > 0 then .[-1] | {actor: .user.login, at: .created_at} else {actor: "", at: ""} end' 2>/dev/null || echo '{}')"
+
+        last_actor="$(printf '%s' "$comments_data" | jq -r '.actor // ""')"
+        last_at="$(printf '%s' "$comments_data" | jq -r '.at // ""')"
+    fi
+
+    # If no comments/reviews, the author is effectively the last actor
+    if [ -z "$last_actor" ]; then
+        last_actor="__author__"
+        last_at=""
+    fi
+
+    # Save to cache
+    printf '{"updated_at":"%s","last_actor":"%s","last_at":"%s"}\n' \
+        "$updated_at" "$last_actor" "$last_at" > "$cache_file"
+
+    printf '%s\t%s\n' "$last_actor" "$last_at"
+}
+
+# Enrich items with last actor info (parallel)
+enrich_with_last_actor() {
+    local item_type repo number title url author updated_at is_draft my_role
+    local running_jobs=0
+
+    while IFS=$'\t' read -r item_type repo number title url author updated_at is_draft my_role; do
+        [ -n "$repo" ] || continue
+
+        (
+            last_actor_data="$(get_last_actor "$item_type" "$repo" "$number" "$updated_at")"
+            last_actor="$(printf '%s' "$last_actor_data" | cut -f1)"
+            last_at="$(printf '%s' "$last_actor_data" | cut -f2)"
+
+            # Determine if waiting on me
+            local waiting_on_me="false"
+            if [ "$last_actor" = "__author__" ]; then
+                # No activity since creation
+                if [ "$my_role" = "reviewer" ]; then
+                    waiting_on_me="true"  # I need to review
+                fi
+            elif [ "$last_actor" != "$MY_USERNAME" ]; then
+                waiting_on_me="true"  # Someone else acted last
+            fi
+
+            # Check if local
+            local is_local="false"
+            local local_path=""
+            if repo_is_local "$repo"; then
+                is_local="true"
+                local_path="$(get_local_path "$repo")"
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$item_type" "$repo" "$number" "$title" "$url" "$author" \
+                "$updated_at" "$is_draft" "$my_role" "$last_actor" "$last_at" \
+                "$waiting_on_me" "$is_local"
+        ) &
+
+        running_jobs=$((running_jobs + 1))
+        if [ "$running_jobs" -ge "$JOBS" ]; then
+            wait
+            running_jobs=0
+        fi
+    done < "$GITHUB_ITEMS_FILE"
+
+    if [ "$running_jobs" -gt 0 ]; then
+        wait
+    fi
+}
+
+# Calculate score for an item
+# Input: type|repo|number|title|url|author|updated_at|is_draft|my_role|last_actor|last_at|waiting_on_me|is_local
+calculate_score() {
+    local item_type="$1"
+    local updated_at="$2"
+    local is_draft="$3"
+    local my_role="$4"
+    local waiting_on_me="$5"
+    local is_local="$6"
+
+    local score=0
+
+    # Waiting on me: +500
+    if [ "$waiting_on_me" = "true" ]; then
+        score=$((score + 500))
+    fi
+
+    # Local repo: +200
+    if [ "$is_local" = "true" ]; then
+        score=$((score + 200))
+    fi
+
+    # Role scoring
+    case "$my_role" in
+        author)   score=$((score + 150)) ;;
+        reviewer) score=$((score + 100)) ;;
+        assignee) score=$((score + 75)) ;;
+        *)        score=$((score + 25)) ;;
+    esac
+
+    # Recency score: 0-100, decays over time
+    local days_ago recency_score
+    if [ -n "$updated_at" ]; then
+        local updated_epoch
+        updated_epoch="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$updated_at" +%s 2>/dev/null || \
+                        date -d "$updated_at" +%s 2>/dev/null || echo "$NOW_EPOCH")"
+        days_ago=$(( (NOW_EPOCH - updated_epoch) / 86400 ))
+        recency_score=$((100 - days_ago * 10))
+        if [ "$recency_score" -lt 0 ]; then
+            recency_score=0
+        fi
+    else
+        recency_score=50
+    fi
+    score=$((score + recency_score))
+
+    # Draft penalty: -100
+    if [ "$is_draft" = "true" ]; then
+        score=$((score - 100))
+    fi
+
+    echo "$score"
+}
+
+# Score all enriched items
+score_items() {
+    local item_type repo number title url author updated_at is_draft my_role last_actor last_at waiting_on_me is_local
+
+    while IFS=$'\t' read -r item_type repo number title url author updated_at is_draft my_role last_actor last_at waiting_on_me is_local; do
+        [ -n "$repo" ] || continue
+
+        local score
+        score="$(calculate_score "$item_type" "$updated_at" "$is_draft" "$my_role" "$waiting_on_me" "$is_local")"
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$score" "$item_type" "$repo" "$number" "$title" "$url" "$author" \
+            "$updated_at" "$is_draft" "$my_role" "$last_actor" "$last_at" \
+            "$waiting_on_me" "$is_local"
+    done < "$ENRICHED_ITEMS_FILE" | sort -t $'\t' -k1,1nr
 }
 
 scan_local_repos() {
@@ -361,255 +704,328 @@ save_repo_cache() {
     cache_key > "$CACHE_ROOTS_FILE"
 }
 
-check_repo_state() {
-    local repo="$1"
-    local dir="$2"
-    local do_fetch="$3"
-    local upstream counts ahead behind branch last_touched
+# Format a single item for display
+format_item() {
+    local score="$1"
+    local item_type="$2"
+    local repo="$3"
+    local number="$4"
+    local title="$5"
+    local url="$6"
+    local author="$7"
+    local updated_at="$8"
+    local is_draft="$9"
+    local my_role="${10}"
+    local last_actor="${11}"
+    local waiting_on_me="${12}"
+    local is_local="${13}"
 
-    last_touched="$(repo_last_touched_epoch "$dir")"
-    printf "R\t%s\t%s\t%s\n" "$repo" "$dir" "$last_touched"
+    local type_icon updated_date role_label local_marker draft_marker last_info
 
-    if [ "$do_fetch" = "true" ]; then
-        if ! git -C "$dir" fetch --quiet --prune origin >/dev/null 2>&1; then
-            printf "F\t%s\n" "$repo"
-        fi
+    # Type icon
+    if [ "$item_type" = "pr" ]; then
+        type_icon="PR"
+    else
+        type_icon="Issue"
     fi
 
-    upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-    if [ -z "$upstream" ]; then
-        printf "N\t%s\n" "$repo"
-        return 0
+    # Updated date (just date part)
+    updated_date="${updated_at:0:10}"
+
+    # Role label
+    case "$my_role" in
+        author)   role_label="author" ;;
+        reviewer) role_label="reviewer" ;;
+        assignee) role_label="assignee" ;;
+        *)        role_label="involved" ;;
+    esac
+
+    # Local marker
+    if [ "$is_local" = "true" ]; then
+        local_marker=" 📂"
+    else
+        local_marker=""
     fi
 
-    counts="$(git -C "$dir" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || true)"
-    if [ -z "$counts" ]; then
-        counts="0 0"
+    # Draft marker
+    if [ "$is_draft" = "true" ]; then
+        draft_marker=" [draft]"
+    else
+        draft_marker=""
     fi
 
-    ahead="${counts%% *}"
-    behind="${counts##* }"
+    # Last actor info
+    if [ "$last_actor" = "__author__" ]; then
+        last_info="no activity since created"
+    elif [ "$last_actor" = "$MY_USERNAME" ]; then
+        last_info="you acted last"
+    else
+        last_info="@$last_actor acted last"
+    fi
 
-    if [ "$behind" -gt 0 ] 2>/dev/null; then
-        branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
-        printf "B\t%s\t%s\t%s\t%s\t%s\n" "$repo" "$branch" "$behind" "$ahead" "$last_touched"
+    printf "  ${DIM}%s${NC} ${BOLD}%s${NC} #%s%s%s\n" "$updated_date" "$repo" "$number" "$local_marker" "$draft_marker"
+    printf "    %s\n" "$title"
+    printf "    ${DIM}%s · %s · %s${NC}\n" "$type_icon" "$role_label" "$last_info"
+    printf "    %s\n" "$url"
+}
+
+# Render the action needed section
+render_action_needed() {
+    local count=0
+    local score item_type repo number title url author updated_at is_draft my_role last_actor last_at waiting_on_me is_local
+
+    echo
+    print_color "$RED" "🔴 ACTION NEEDED (waiting on you)"
+    echo
+
+    while IFS=$'\t' read -r score item_type repo number title url author updated_at is_draft my_role last_actor last_at waiting_on_me is_local; do
+        [ -n "$repo" ] || continue
+        [ "$waiting_on_me" = "true" ] || continue
+
+        format_item "$score" "$item_type" "$repo" "$number" "$title" "$url" "$author" \
+            "$updated_at" "$is_draft" "$my_role" "$last_actor" "$waiting_on_me" "$is_local"
+        echo
+        count=$((count + 1))
+    done < "$SCORED_ITEMS_FILE"
+
+    if [ "$count" -eq 0 ]; then
+        echo "  (none - you're all caught up!)"
+        echo
     fi
 }
 
-print_local_behind() {
-    local repo dir
-    local running_jobs=0
-    local total_behind_count=0
-    local behind_count=0
-    local no_upstream_count=0
-    local fetch_fail_count=0
+# Render the waiting on others section
+render_waiting_on_others() {
+    local count=0
+    local score item_type repo number title url author updated_at is_draft my_role last_actor last_at waiting_on_me is_local
 
-    print_color "$BLUE" "Local repositories behind upstream"
+    print_color "$YELLOW" "🟡 WAITING ON OTHERS (ball in their court)"
+    echo
 
-    : > "$BEHIND_RAW_FILE"
-    : > "$BEHIND_FILE"
+    while IFS=$'\t' read -r score item_type repo number title url author updated_at is_draft my_role last_actor last_at waiting_on_me is_local; do
+        [ -n "$repo" ] || continue
+        [ "$waiting_on_me" = "false" ] || continue
+
+        format_item "$score" "$item_type" "$repo" "$number" "$title" "$url" "$author" \
+            "$updated_at" "$is_draft" "$my_role" "$last_actor" "$waiting_on_me" "$is_local"
+        echo
+        count=$((count + 1))
+    done < "$SCORED_ITEMS_FILE"
+
+    if [ "$count" -eq 0 ]; then
+        echo "  (none)"
+        echo
+    fi
+}
+
+# Render cleanup candidates
+render_cleanup_candidates() {
+    local stale_count=0
+    local repo dir touched age_days
+    local has_open_work
+
+    print_color "$BLUE" "🗑️  CLEANUP CANDIDATES (stale local repos with no open GitHub work)"
+    echo
+
+    # Build list of repos with open items
+    local repos_with_work
+    repos_with_work="$(awk -F '\t' '{print $3}' "$SCORED_ITEMS_FILE" | sort -u)"
 
     while IFS=$'\t' read -r repo dir; do
         [ -n "$repo" ] || continue
         [ -d "$dir" ] || continue
 
-        check_repo_state "$repo" "$dir" "$FETCH" >> "$BEHIND_RAW_FILE" &
-        running_jobs=$((running_jobs + 1))
+        touched="$(repo_last_touched_epoch "$dir")"
+        age_days=$(( (NOW_EPOCH - touched) / 86400 ))
 
-        if [ "$running_jobs" -ge "$JOBS" ]; then
-            wait
-            running_jobs=0
+        if [ "$age_days" -ge "$STALE_DAYS" ]; then
+            # Check if repo has open work
+            has_open_work="false"
+            if echo "$repos_with_work" | grep -Fxq "$repo"; then
+                has_open_work="true"
+            fi
+
+            if [ "$has_open_work" = "false" ]; then
+                printf "  - %s (%d days stale)\n" "$repo" "$age_days"
+                printf "    %s\n" "$dir"
+                stale_count=$((stale_count + 1))
+            fi
         fi
-    done < <(sort "$LOCAL_REPOS_FILE")
-
-    if [ "$running_jobs" -gt 0 ]; then
-        wait
-    fi
-
-    total_behind_count="$(awk -F '\t' '$1=="B"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
-    behind_count="$(awk -F '\t' -v cutoff="$EVENT_CUTOFF_EPOCH" '$1=="B" && $6 >= cutoff {c++} END{print c+0}' "$BEHIND_RAW_FILE")"
-    no_upstream_count="$(awk -F '\t' '$1=="N"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
-    fetch_fail_count="$(awk -F '\t' '$1=="F"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
-
-    awk -F '\t' -v cutoff="$EVENT_CUTOFF_EPOCH" '$1=="B" && $6 >= cutoff {printf "  - %s (%s): behind %s, ahead %s\n", $2, $3, $4, $5}' "$BEHIND_RAW_FILE" | sort > "$BEHIND_FILE"
-
-    if [ "$behind_count" -eq 0 ]; then
-        echo "  - none"
-    else
-        cat "$BEHIND_FILE"
-    fi
-
-    if [ "$no_upstream_count" -gt 0 ]; then
-        echo "  note: $no_upstream_count repos have no upstream tracking branch."
-    fi
-
-    if [ "$FETCH" = "true" ] && [ "$fetch_fail_count" -gt 0 ]; then
-        echo "  note: fetch failed in $fetch_fail_count repos; some counts may be stale."
-    fi
-
-    if [ "$total_behind_count" -gt "$behind_count" ]; then
-        echo "  note: $((total_behind_count - behind_count)) behind repos omitted by activity window."
-    fi
-
-    echo
-}
-
-print_cleanup_candidates() {
-    local stale_count=0
-
-    print_color "$BLUE" "Local repositories suggested for cleanup (${STALE_DAYS}+ days untouched)"
-    : > "$STALE_FILE"
-
-    awk -F '\t' -v now="$NOW_EPOCH" -v stale_days="$STALE_DAYS" '
-        $1 == "R" {
-            repo = $2
-            dir = $3
-            touched = $4 + 0
-            age_days = int((now - touched) / 86400)
-            if (touched > 0 && age_days >= stale_days) {
-                printf "%d\t%s\t%s\n", age_days, repo, dir
-            }
-        }
-    ' "$BEHIND_RAW_FILE" | sort -nr -k1,1 > "$STALE_FILE"
-
-    stale_count="$(wc -l < "$STALE_FILE" | tr -d ' ')"
+    done < "$LOCAL_REPOS_FILE"
 
     if [ "$stale_count" -eq 0 ]; then
-        echo "  - none"
-    else
-        awk -F '\t' '{printf "  - %s (%s days): %s\n", $2, $1, $3}' "$STALE_FILE"
+        echo "  (none)"
     fi
-
     echo
 }
 
-print_local_reviews() {
-    local reviews_json parsed_lines
-    local repo updated state title url
-    local local_review_count=0
+# Render local repos behind upstream (quick status)
+render_local_behind() {
+    local repo dir behind_count=0
+    local upstream counts ahead behind branch
 
-    print_color "$BLUE" "Review requests in local repositories (activity window)"
+    print_color "$CYAN" "📥 LOCAL REPOS BEHIND UPSTREAM"
+    echo
 
-    if ! command_exists jq; then
-        echo "  - skipped (jq not installed)"
-        echo
-        return 0
+    while IFS=$'\t' read -r repo dir; do
+        [ -n "$repo" ] || continue
+        [ -d "$dir" ] || continue
+
+        if [ "$FETCH" = "true" ]; then
+            git -C "$dir" fetch --quiet --prune origin >/dev/null 2>&1 || true
+        fi
+
+        upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+        [ -n "$upstream" ] || continue
+
+        counts="$(git -C "$dir" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || echo "0 0")"
+        ahead="${counts%% *}"
+        behind="${counts##* }"
+
+        if [ "$behind" -gt 0 ] 2>/dev/null; then
+            branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "detached")"
+            printf "  - %s (%s): ↓%s ↑%s\n" "$repo" "$branch" "$behind" "$ahead"
+            behind_count=$((behind_count + 1))
+        fi
+    done < "$LOCAL_REPOS_FILE"
+
+    if [ "$behind_count" -eq 0 ]; then
+        echo "  (all up to date)"
     fi
+    echo
+}
 
-    reviews_json="$("$GH_REAL_BIN" search prs \
-        --review-requested=@me \
-        --state=open \
-        --limit "$LIMIT" \
-        --json repository,title,url,updatedAt,isDraft 2>/dev/null || true)"
+# Render recent AI coding sessions (Claude Code, Codex)
+render_ai_sessions() {
+    local claude_dir="$HOME/.claude/projects"
+    local codex_dir="$HOME/.codex/sessions"
+    local session_days="${AI_SESSION_DAYS:-7}"
+    local max_sessions="${AI_SESSION_MAX:-15}"
 
-    [ -n "$reviews_json" ] || reviews_json="[]"
+    print_color "$YELLOW" "🤖 RECENT AI CODING SESSIONS (last ${session_days} days)"
+    echo
 
-    parsed_lines="$(printf '%s' "$reviews_json" | jq -r --argjson cutoff "$EVENT_CUTOFF_EPOCH" '.[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [.repository.nameWithOwner, .updatedAt[0:10], (if .isDraft then "draft" else "open" end), .title, .url] | @tsv' 2>/dev/null || true)"
+    # Collect sessions into temp file for sorting
+    local sessions_tmp file_list
+    sessions_tmp="$(mktemp)"
+    file_list="$(mktemp)"
 
-    if [ -n "$parsed_lines" ]; then
-        while IFS=$'\t' read -r repo updated state title url; do
-            [ -n "$repo" ] || continue
-            if repo_is_local "$repo"; then
-                printf "  - %s %s [%s] %s\n    %s\n" "$updated" "$repo" "$state" "$title" "$url" >> "$REVIEWS_FILE"
-                local_review_count=$((local_review_count + 1))
+    # Claude Code sessions - get most recent files excluding subagents and Intent workspaces
+    if [ -d "$claude_dir" ]; then
+        find "$claude_dir" -name "*.jsonl" -mtime "-${session_days}" -size +1k \
+            ! -path "*/subagents/*" \
+            ! -path "*-intent-workspaces-*" \
+            -exec stat -f '%m %N' {} \; 2>/dev/null | \
+            sort -rn | head -"$max_sessions" > "$file_list"
+
+        local claude_count
+        claude_count=$(wc -l < "$file_list" | tr -d ' ')
+        print_debug "Claude sessions file list: $claude_count files"
+
+        # Process each line using fd 3 to avoid jq consuming stdin
+        local line mtime_epoch f proj proj_decoded mtime_display first_msg
+        while IFS= read -r line <&3; do
+            mtime_epoch="${line%% *}"
+            f="${line#* }"
+            [ -n "$f" ] || continue
+            [ -f "$f" ] || continue
+
+            # Get project path from directory name
+            proj=$(dirname "$f" | sed 's|.*/projects/||')
+            proj_decoded=$(echo "$proj" | sed 's|^-|/|' | tr '-' '/')
+
+            # Get display time
+            mtime_display=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f" 2>/dev/null || echo "unknown")
+
+            # Get first user message - quick extraction (|| true to handle empty files gracefully)
+            first_msg=$(
+                grep -m1 -E '"type":"(user|human)"' "$f" 2>/dev/null | \
+                jq -r '(if .message.content | type == "array" then .message.content[0].text else .message.content end) // ""' 2>/dev/null | \
+                head -c 150 | tr '\n\t' '  '
+            ) || true
+
+            # Skip system prompts, interrupts, and empty messages
+            case "$first_msg" in
+                *"# Your Specialist Role"*|*"<specialist_role>"*|*"Role Reminder:"*)
+                    continue
+                    ;;
+                "[Request interrupted"*|"<local-command-caveat>"*|"")
+                    continue
+                    ;;
+            esac
+
+            if [ ${#first_msg} -gt 5 ]; then
+                printf '%s\t%s\t%s\t%s\t%s\n' "$mtime_epoch" "$mtime_display" "claude" "$proj_decoded" "${first_msg:0:100}" >> "$sessions_tmp"
             fi
-        done <<EOF
-$parsed_lines
-EOF
+        done 3< "$file_list"
     fi
 
-    if [ "$local_review_count" -eq 0 ]; then
-        echo "  - none"
-    else
-        cat "$REVIEWS_FILE"
-    fi
+    # Codex sessions - get most recent files
+    if [ -d "$codex_dir" ]; then
+        find "$codex_dir" -name "*.jsonl" -mtime "-${session_days}" -size +1k \
+            -exec stat -f '%m %N' {} \; 2>/dev/null | \
+            sort -rn | head -"$max_sessions" > "$file_list"
 
-    echo
-}
+        local codex_count
+        codex_count=$(wc -l < "$file_list" | tr -d ' ')
+        print_debug "Codex sessions file list: $codex_count files"
 
-print_local_mentions() {
-    local mentions_json parsed_lines
-    local repo updated title url
-    local local_mention_count=0
+        local line mtime_epoch f mtime_display cwd first_msg
+        while IFS= read -r line <&3; do
+            mtime_epoch="${line%% *}"
+            f="${line#* }"
+            [ -n "$f" ] || continue
+            [ -f "$f" ] || continue
 
-    print_color "$BLUE" "Mentions in local repositories (activity window)"
+            # Get display time
+            mtime_display=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f" 2>/dev/null || echo "unknown")
 
-    if ! command_exists jq; then
-        echo "  - skipped (jq not installed)"
-        echo
-        return 0
-    fi
+            # Get session metadata (first line) and first user message
+            cwd=$(head -1 "$f" 2>/dev/null | jq -r '.payload.cwd // ""' 2>/dev/null) || true
+            first_msg=$(grep -m1 '"role":"user"' "$f" 2>/dev/null | jq -r '.payload.content[0].text // ""' 2>/dev/null | head -c 100 | tr '\n\t' '  ') || true
 
-    mentions_json="$("$GH_REAL_BIN" search issues \
-        --mentions=@me \
-        --state=open \
-        --include-prs \
-        --limit "$LIMIT" \
-        --json repository,title,url,updatedAt 2>/dev/null || true)"
+            # Skip system prompts
+            case "$first_msg" in
+                "# AGENTS.md"*|*"<INSTRUCTIONS>"*)
+                    continue
+                    ;;
+            esac
 
-    [ -n "$mentions_json" ] || mentions_json="[]"
-
-    parsed_lines="$(printf '%s' "$mentions_json" | jq -r --argjson cutoff "$EVENT_CUTOFF_EPOCH" '.[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [.repository.nameWithOwner, .updatedAt[0:10], .title, .url] | @tsv' 2>/dev/null || true)"
-
-    if [ -n "$parsed_lines" ]; then
-        while IFS=$'\t' read -r repo updated title url; do
-            [ -n "$repo" ] || continue
-            if repo_is_local "$repo"; then
-                printf "  - %s %s %s\n    %s\n" "$updated" "$repo" "$title" "$url" >> "$MENTIONS_FILE"
-                local_mention_count=$((local_mention_count + 1))
+            if [ -n "$cwd" ] && [ "$cwd" != "null" ] && [ -n "$first_msg" ] && [ "$first_msg" != "null" ] && [ ${#first_msg} -gt 5 ]; then
+                printf '%s\t%s\t%s\t%s\t%s\n' "$mtime_epoch" "$mtime_display" "codex" "$cwd" "$first_msg" >> "$sessions_tmp"
             fi
-        done <<EOF
-$parsed_lines
-EOF
+        done 3< "$file_list"
     fi
 
-    if [ "$local_mention_count" -eq 0 ]; then
-        echo "  - none"
+    rm -f "$file_list"
+
+    print_debug "Total sessions collected: $(wc -l < "$sessions_tmp" 2>/dev/null || echo 0)"
+
+    # Sort by time (newest first) and display
+    local session_count=0
+    if [ -s "$sessions_tmp" ]; then
+        while IFS=$'\t' read -r _ mtime_display tool proj first_msg; do
+            local tool_icon
+            case "$tool" in
+                claude) tool_icon="🟠" ;;
+                codex)  tool_icon="🟢" ;;
+                *)      tool_icon="⚪" ;;
+            esac
+            printf "  ${DIM}%s${NC} %s %s\n" "$mtime_display" "$tool_icon" "$tool"
+            printf "    📁 %s\n" "$proj"
+            printf "    💬 %s...\n" "${first_msg:0:70}"
+            echo
+            session_count=$((session_count + 1))
+        done < <(sort -t $'\t' -k1,1nr "$sessions_tmp" | head -15)
+    fi
+
+    rm -f "$sessions_tmp"
+
+    if [ "$session_count" -eq 0 ]; then
+        echo "  (no recent AI sessions found)"
     else
-        cat "$MENTIONS_FILE"
+        echo "  ${DIM}Resume with: claude --resume or codex resume${NC}"
     fi
-
-    echo
-}
-
-print_global_activity() {
-    local global_json parsed_lines
-    local updated repo kind title url
-    local count=0
-
-    print_color "$BLUE" "Global activity in activity window"
-
-    if ! command_exists jq; then
-        echo "  - skipped (jq not installed)"
-        echo
-        return 0
-    fi
-
-    global_json="$("$GH_REAL_BIN" search issues \
-        --involves=@me \
-        --state=open \
-        --include-prs \
-        --limit "$LIMIT" \
-        --json repository,title,url,updatedAt,isPullRequest 2>/dev/null || true)"
-
-    [ -n "$global_json" ] || global_json="[]"
-
-    parsed_lines="$(printf '%s' "$global_json" | jq -r --argjson cutoff "$EVENT_CUTOFF_EPOCH" '.[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [.updatedAt[0:10], .repository.nameWithOwner, (if .isPullRequest then "PR" else "Issue" end), .title, .url] | @tsv' 2>/dev/null || true)"
-
-    if [ -n "$parsed_lines" ]; then
-        while IFS=$'\t' read -r updated repo kind title url; do
-            [ -n "$repo" ] || continue
-            printf "  - %s %s [%s] %s\n    %s\n" "$updated" "$repo" "$kind" "$title" "$url"
-            count=$((count + 1))
-        done <<EOF
-$parsed_lines
-EOF
-    fi
-
-    if [ "$count" -eq 0 ]; then
-        echo "  - none"
-    fi
-
     echo
 }
 
@@ -621,12 +1037,6 @@ main() {
                 ;;
             --fetch)
                 FETCH=true
-                ;;
-            --no-global)
-                SHOW_GLOBAL=false
-                ;;
-            --no-mentions)
-                SHOW_MENTIONS=false
                 ;;
             --jobs)
                 shift
@@ -756,56 +1166,72 @@ main() {
         ROOTS="$(default_roots)"
     fi
 
+    # Check for jq dependency
+    if ! command_exists jq; then
+        print_error "jq is required for JSON processing"
+        exit 1
+    fi
+
+    # Create temp files
     LOCAL_REPOS_FILE="$(mktemp -t gh-monday.local.XXXXXX)"
-    BEHIND_FILE="$(mktemp -t gh-monday.behind.XXXXXX)"
-    BEHIND_RAW_FILE="$(mktemp -t gh-monday.behindraw.XXXXXX)"
-    REVIEWS_FILE="$(mktemp -t gh-monday.reviews.XXXXXX)"
-    MENTIONS_FILE="$(mktemp -t gh-monday.mentions.XXXXXX)"
-    STALE_FILE="$(mktemp -t gh-monday.stale.XXXXXX)"
+    REPO_STATE_FILE="$(mktemp -t gh-monday.repostate.XXXXXX)"
+    GITHUB_ITEMS_FILE="$(mktemp -t gh-monday.github.XXXXXX)"
+    ENRICHED_ITEMS_FILE="$(mktemp -t gh-monday.enriched.XXXXXX)"
+    SCORED_ITEMS_FILE="$(mktemp -t gh-monday.scored.XXXXXX)"
     trap cleanup EXIT
 
     init_time_window
 
+    # Get current user
+    print_debug "Getting current user..."
+    MY_USERNAME="$(get_my_username)"
+    if [ -z "$MY_USERNAME" ]; then
+        print_error "Could not determine GitHub username. Are you logged in? (gh auth status)"
+        exit 1
+    fi
+    print_debug "Logged in as: $MY_USERNAME"
+
+    # Phase 1: Discover local repos
+    print_debug "Phase 1: Discovering local repositories..."
     if ! load_repo_cache; then
         scan_local_repos
         save_repo_cache
     fi
-
     local_repo_count="$(wc -l < "$LOCAL_REPOS_FILE" | tr -d ' ')"
+    print_debug "Found $local_repo_count local repos"
 
-    print_color "$GREEN" "GitHub Monday Triage ($(date '+%Y-%m-%d %H:%M'))"
-    print_color "$WHITE" "gh binary: $GH_REAL_BIN"
-    print_color "$WHITE" "local roots: $ROOTS"
-    print_color "$WHITE" "local GitHub repos discovered: $local_repo_count"
-    print_color "$WHITE" "repo scan max depth: $FIND_MAX_DEPTH"
-    print_color "$WHITE" "behind check workers: $JOBS"
-    print_color "$WHITE" "fetch remotes for behind check: $FETCH"
-    print_color "$WHITE" "activity lookback days: $LOOKBACK_DAYS"
-    print_color "$WHITE" "weekly baseline key: $WEEK_KEY"
-    print_color "$WHITE" "weekly first run: $(epoch_to_text "$WEEK_FIRST_RUN_EPOCH")"
-    print_color "$WHITE" "effective activity cutoff: $(epoch_to_text "$EVENT_CUTOFF_EPOCH")"
-    if [ "$WEEK_FIRST_RUN_IS_NEW" = "true" ]; then
-        print_color "$WHITE" "weekly baseline status: initialized on this run"
-    else
-        print_color "$WHITE" "weekly baseline status: reused cached first run"
-    fi
-    echo
+    # Phase 2: Fetch GitHub items
+    print_debug "Phase 2: Fetching GitHub items..."
+    fetch_github_items > "$GITHUB_ITEMS_FILE"
+    github_item_count="$(wc -l < "$GITHUB_ITEMS_FILE" | tr -d ' ')"
+    print_debug "Found $github_item_count GitHub items"
 
-    if [ "$local_repo_count" -eq 0 ]; then
-        print_warn "No local GitHub repositories found under configured roots."
-        echo
-    else
-        print_local_behind
-        print_cleanup_candidates
-        print_local_reviews
-        if [ "$SHOW_MENTIONS" = "true" ]; then
-            print_local_mentions
-        fi
+    # Phase 3: Enrich with last actor
+    print_debug "Phase 3: Enriching with last actor info..."
+    enrich_with_last_actor > "$ENRICHED_ITEMS_FILE"
+    print_debug "Enrichment complete"
+
+    # Phase 4: Score and rank
+    print_debug "Phase 4: Scoring and ranking..."
+    score_items > "$SCORED_ITEMS_FILE"
+    print_debug "Scoring complete"
+
+    # Output header
+    print_color "$GREEN" "═══════════════════════════════════════════════════════════════"
+    print_color "$GREEN" "  GitHub Triage - $(date '+%Y-%m-%d %H:%M')"
+    print_color "$GREEN" "═══════════════════════════════════════════════════════════════"
+    print_color "$DIM" "  user: @$MY_USERNAME | local repos: $local_repo_count | items: $github_item_count"
+    if [ "$DEBUG" = "true" ]; then
+        print_color "$DIM" "  roots: $ROOTS"
+        print_color "$DIM" "  lookback: $LOOKBACK_DAYS days | cutoff: $(epoch_to_text "$EVENT_CUTOFF_EPOCH")"
     fi
 
-    if [ "$SHOW_GLOBAL" = "true" ]; then
-        print_global_activity
-    fi
+    # Render sections
+    render_action_needed
+    render_waiting_on_others
+    render_local_behind
+    render_ai_sessions
+    render_cleanup_candidates
 }
 
 main "$@"
