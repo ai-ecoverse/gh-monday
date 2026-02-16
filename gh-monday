@@ -25,6 +25,17 @@ JOBS="${GH_MONDAY_JOBS:-8}"
 USE_REPO_CACHE=true
 REPO_CACHE_TTL="${GH_MONDAY_REPO_CACHE_TTL:-21600}"
 FIND_MAX_DEPTH="${GH_MONDAY_MAX_DEPTH:-6}"
+LOOKBACK_DAYS="${GH_MONDAY_DAYS:-7}"
+STALE_DAYS="${GH_MONDAY_STALE_DAYS:-30}"
+RESET_WEEK_CACHE=false
+
+# Computed time window
+NOW_EPOCH=0
+LOOKBACK_CUTOFF_EPOCH=0
+EVENT_CUTOFF_EPOCH=0
+WEEK_FIRST_RUN_EPOCH=0
+WEEK_FIRST_RUN_IS_NEW=false
+WEEK_KEY=""
 
 # Temp files
 LOCAL_REPOS_FILE=""
@@ -32,11 +43,13 @@ BEHIND_FILE=""
 BEHIND_RAW_FILE=""
 REVIEWS_FILE=""
 MENTIONS_FILE=""
+STALE_FILE=""
 
 # Cache files
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gh-monday"
 CACHE_REPOS_FILE="$CACHE_DIR/local-repos.tsv"
 CACHE_ROOTS_FILE="$CACHE_DIR/local-repos.roots"
+CACHE_WEEKLY_FILE="$CACHE_DIR/weekly-first-run.tsv"
 
 cache_key() {
     printf '%s|%s\n' "$ROOTS" "$FIND_MAX_DEPTH"
@@ -67,7 +80,7 @@ command_exists() {
 }
 
 cleanup() {
-    rm -f "$LOCAL_REPOS_FILE" "$BEHIND_FILE" "$BEHIND_RAW_FILE" "$REVIEWS_FILE" "$MENTIONS_FILE"
+    rm -f "$LOCAL_REPOS_FILE" "$BEHIND_FILE" "$BEHIND_RAW_FILE" "$REVIEWS_FILE" "$MENTIONS_FILE" "$STALE_FILE"
 }
 
 resolve_gh_binary() {
@@ -153,6 +166,92 @@ is_true() {
     esac
 }
 
+epoch_to_text() {
+    local epoch="$1"
+    date -r "$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$epoch"
+}
+
+current_week_key() {
+    date '+%G-W%V' 2>/dev/null || date '+%Y-W%U'
+}
+
+max_int() {
+    local a="$1"
+    local b="$2"
+    if [ "$a" -ge "$b" ]; then
+        echo "$a"
+    else
+        echo "$b"
+    fi
+}
+
+init_time_window() {
+    local cache_week cache_epoch
+
+    NOW_EPOCH="$(date +%s)"
+    LOOKBACK_CUTOFF_EPOCH=$((NOW_EPOCH - (LOOKBACK_DAYS * 86400)))
+    WEEK_KEY="$(current_week_key)"
+
+    mkdir -p "$CACHE_DIR"
+    if [ "$RESET_WEEK_CACHE" = "true" ]; then
+        rm -f "$CACHE_WEEKLY_FILE"
+    fi
+
+    if [ -f "$CACHE_WEEKLY_FILE" ]; then
+        cache_week="$(awk -F '\t' 'NR==1{print $1}' "$CACHE_WEEKLY_FILE" 2>/dev/null || true)"
+        cache_epoch="$(awk -F '\t' 'NR==1{print $2}' "$CACHE_WEEKLY_FILE" 2>/dev/null || true)"
+        if [ "$cache_week" = "$WEEK_KEY" ] && [[ "$cache_epoch" =~ ^[0-9]+$ ]]; then
+            WEEK_FIRST_RUN_EPOCH="$cache_epoch"
+            WEEK_FIRST_RUN_IS_NEW=false
+        else
+            WEEK_FIRST_RUN_EPOCH="$NOW_EPOCH"
+            WEEK_FIRST_RUN_IS_NEW=true
+            printf '%s\t%s\n' "$WEEK_KEY" "$WEEK_FIRST_RUN_EPOCH" > "$CACHE_WEEKLY_FILE"
+        fi
+    else
+        WEEK_FIRST_RUN_EPOCH="$NOW_EPOCH"
+        WEEK_FIRST_RUN_IS_NEW=true
+        printf '%s\t%s\n' "$WEEK_KEY" "$WEEK_FIRST_RUN_EPOCH" > "$CACHE_WEEKLY_FILE"
+    fi
+
+    if [ "$WEEK_FIRST_RUN_IS_NEW" = "true" ]; then
+        # First run this week: show the rolling lookback window.
+        EVENT_CUTOFF_EPOCH="$LOOKBACK_CUTOFF_EPOCH"
+    else
+        EVENT_CUTOFF_EPOCH="$(max_int "$LOOKBACK_CUTOFF_EPOCH" "$WEEK_FIRST_RUN_EPOCH")"
+    fi
+}
+
+repo_last_touched_epoch() {
+    local repo_dir="$1"
+    local git_dir mtime max_mtime last_commit_epoch
+
+    git_dir="$(git -C "$repo_dir" rev-parse --absolute-git-dir 2>/dev/null || echo "$repo_dir/.git")"
+    max_mtime=0
+
+    for candidate in \
+        "$git_dir/index" \
+        "$git_dir/logs/HEAD" \
+        "$git_dir/FETCH_HEAD" \
+        "$git_dir/HEAD"
+    do
+        if [ -e "$candidate" ]; then
+            mtime="$(file_mtime "$candidate")"
+            if [ "$mtime" -gt "$max_mtime" ] 2>/dev/null; then
+                max_mtime="$mtime"
+            fi
+        fi
+    done
+
+    if [ "$max_mtime" -gt 0 ] 2>/dev/null; then
+        echo "$max_mtime"
+        return 0
+    fi
+
+    last_commit_epoch="$(git -C "$repo_dir" log -1 --format=%ct 2>/dev/null || echo 0)"
+    echo "${last_commit_epoch:-0}"
+}
+
 usage() {
     cat <<'EOF'
 Usage: gh monday [options]
@@ -161,15 +260,18 @@ A local-first Monday morning triage view:
   1. Local repositories behind upstream
   2. Review requests in local repositories
   3. Mentions in local repositories
-  4. Full global gh status snapshot
+  4. Filtered global activity snapshot
 
 Options:
   --fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
   --no-fetch      Do not fetch remotes before behind/ahead checks
-  --no-global     Skip the final global `gh status` section
+  --no-global     Skip the final global activity section
   --no-mentions   Skip the mentions section
   --jobs N        Parallelism for local repo checks (default: 8)
   --max-depth N   Max directory depth when scanning for local repos (default: 6)
+  --days N        Rolling lookback window in days for activity (default: 7)
+  --stale-days N  Suggest cleanup for local repos untouched for N days (default: 30)
+  --reset-week-cache  Start a new weekly baseline now
   --no-cache      Disable local-repo discovery cache
   --cache-ttl S   Cache TTL in seconds for repo discovery (default: 21600)
   --limit N       Max search results fetched per section (default: 120)
@@ -184,6 +286,8 @@ Environment:
   GH_MONDAY_FETCH   true/false default fetch behavior (default: false)
   GH_MONDAY_JOBS    Parallel workers for local repo checks (default: 8)
   GH_MONDAY_MAX_DEPTH  Max scan depth for repo discovery (default: 6)
+  GH_MONDAY_DAYS    Rolling lookback window in days (default: 7)
+  GH_MONDAY_STALE_DAYS  Stale repo threshold in days (default: 30)
   GH_MONDAY_REPO_CACHE_TTL  Repo cache TTL in seconds (default: 21600)
   GH_MONDAY_DEBUG   Set to true for debug output
 EOF
@@ -261,7 +365,10 @@ check_repo_state() {
     local repo="$1"
     local dir="$2"
     local do_fetch="$3"
-    local upstream counts ahead behind branch
+    local upstream counts ahead behind branch last_touched
+
+    last_touched="$(repo_last_touched_epoch "$dir")"
+    printf "R\t%s\t%s\t%s\n" "$repo" "$dir" "$last_touched"
 
     if [ "$do_fetch" = "true" ]; then
         if ! git -C "$dir" fetch --quiet --prune origin >/dev/null 2>&1; then
@@ -285,13 +392,14 @@ check_repo_state() {
 
     if [ "$behind" -gt 0 ] 2>/dev/null; then
         branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
-        printf "B\t%s\t%s\t%s\t%s\n" "$repo" "$branch" "$behind" "$ahead"
+        printf "B\t%s\t%s\t%s\t%s\t%s\n" "$repo" "$branch" "$behind" "$ahead" "$last_touched"
     fi
 }
 
 print_local_behind() {
     local repo dir
     local running_jobs=0
+    local total_behind_count=0
     local behind_count=0
     local no_upstream_count=0
     local fetch_fail_count=0
@@ -318,11 +426,12 @@ print_local_behind() {
         wait
     fi
 
-    behind_count="$(awk -F '\t' '$1=="B"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
+    total_behind_count="$(awk -F '\t' '$1=="B"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
+    behind_count="$(awk -F '\t' -v cutoff="$EVENT_CUTOFF_EPOCH" '$1=="B" && $6 >= cutoff {c++} END{print c+0}' "$BEHIND_RAW_FILE")"
     no_upstream_count="$(awk -F '\t' '$1=="N"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
     fetch_fail_count="$(awk -F '\t' '$1=="F"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
 
-    awk -F '\t' '$1=="B"{printf "  - %s (%s): behind %s, ahead %s\n", $2, $3, $4, $5}' "$BEHIND_RAW_FILE" | sort > "$BEHIND_FILE"
+    awk -F '\t' -v cutoff="$EVENT_CUTOFF_EPOCH" '$1=="B" && $6 >= cutoff {printf "  - %s (%s): behind %s, ahead %s\n", $2, $3, $4, $5}' "$BEHIND_RAW_FILE" | sort > "$BEHIND_FILE"
 
     if [ "$behind_count" -eq 0 ]; then
         echo "  - none"
@@ -338,6 +447,39 @@ print_local_behind() {
         echo "  note: fetch failed in $fetch_fail_count repos; some counts may be stale."
     fi
 
+    if [ "$total_behind_count" -gt "$behind_count" ]; then
+        echo "  note: $((total_behind_count - behind_count)) behind repos omitted by activity window."
+    fi
+
+    echo
+}
+
+print_cleanup_candidates() {
+    local stale_count=0
+
+    print_color "$BLUE" "Local repositories suggested for cleanup (${STALE_DAYS}+ days untouched)"
+    : > "$STALE_FILE"
+
+    awk -F '\t' -v now="$NOW_EPOCH" -v stale_days="$STALE_DAYS" '
+        $1 == "R" {
+            repo = $2
+            dir = $3
+            touched = $4 + 0
+            age_days = int((now - touched) / 86400)
+            if (touched > 0 && age_days >= stale_days) {
+                printf "%d\t%s\t%s\n", age_days, repo, dir
+            }
+        }
+    ' "$BEHIND_RAW_FILE" | sort -nr -k1,1 > "$STALE_FILE"
+
+    stale_count="$(wc -l < "$STALE_FILE" | tr -d ' ')"
+
+    if [ "$stale_count" -eq 0 ]; then
+        echo "  - none"
+    else
+        awk -F '\t' '{printf "  - %s (%s days): %s\n", $2, $1, $3}' "$STALE_FILE"
+    fi
+
     echo
 }
 
@@ -346,7 +488,7 @@ print_local_reviews() {
     local repo updated state title url
     local local_review_count=0
 
-    print_color "$BLUE" "Review requests in local repositories"
+    print_color "$BLUE" "Review requests in local repositories (activity window)"
 
     if ! command_exists jq; then
         echo "  - skipped (jq not installed)"
@@ -362,7 +504,7 @@ print_local_reviews() {
 
     [ -n "$reviews_json" ] || reviews_json="[]"
 
-    parsed_lines="$(printf '%s' "$reviews_json" | jq -r '.[] | [.repository.nameWithOwner, .updatedAt[0:10], (if .isDraft then "draft" else "open" end), .title, .url] | @tsv' 2>/dev/null || true)"
+    parsed_lines="$(printf '%s' "$reviews_json" | jq -r --argjson cutoff "$EVENT_CUTOFF_EPOCH" '.[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [.repository.nameWithOwner, .updatedAt[0:10], (if .isDraft then "draft" else "open" end), .title, .url] | @tsv' 2>/dev/null || true)"
 
     if [ -n "$parsed_lines" ]; then
         while IFS=$'\t' read -r repo updated state title url; do
@@ -390,7 +532,7 @@ print_local_mentions() {
     local repo updated title url
     local local_mention_count=0
 
-    print_color "$BLUE" "Mentions in local repositories"
+    print_color "$BLUE" "Mentions in local repositories (activity window)"
 
     if ! command_exists jq; then
         echo "  - skipped (jq not installed)"
@@ -407,7 +549,7 @@ print_local_mentions() {
 
     [ -n "$mentions_json" ] || mentions_json="[]"
 
-    parsed_lines="$(printf '%s' "$mentions_json" | jq -r '.[] | [.repository.nameWithOwner, .updatedAt[0:10], .title, .url] | @tsv' 2>/dev/null || true)"
+    parsed_lines="$(printf '%s' "$mentions_json" | jq -r --argjson cutoff "$EVENT_CUTOFF_EPOCH" '.[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [.repository.nameWithOwner, .updatedAt[0:10], .title, .url] | @tsv' 2>/dev/null || true)"
 
     if [ -n "$parsed_lines" ]; then
         while IFS=$'\t' read -r repo updated title url; do
@@ -425,6 +567,47 @@ EOF
         echo "  - none"
     else
         cat "$MENTIONS_FILE"
+    fi
+
+    echo
+}
+
+print_global_activity() {
+    local global_json parsed_lines
+    local updated repo kind title url
+    local count=0
+
+    print_color "$BLUE" "Global activity in activity window"
+
+    if ! command_exists jq; then
+        echo "  - skipped (jq not installed)"
+        echo
+        return 0
+    fi
+
+    global_json="$("$GH_REAL_BIN" search issues \
+        --involves=@me \
+        --state=open \
+        --include-prs \
+        --limit "$LIMIT" \
+        --json repository,title,url,updatedAt,isPullRequest 2>/dev/null || true)"
+
+    [ -n "$global_json" ] || global_json="[]"
+
+    parsed_lines="$(printf '%s' "$global_json" | jq -r --argjson cutoff "$EVENT_CUTOFF_EPOCH" '.[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [.updatedAt[0:10], .repository.nameWithOwner, (if .isPullRequest then "PR" else "Issue" end), .title, .url] | @tsv' 2>/dev/null || true)"
+
+    if [ -n "$parsed_lines" ]; then
+        while IFS=$'\t' read -r updated repo kind title url; do
+            [ -n "$repo" ] || continue
+            printf "  - %s %s [%s] %s\n    %s\n" "$updated" "$repo" "$kind" "$title" "$url"
+            count=$((count + 1))
+        done <<EOF
+$parsed_lines
+EOF
+    fi
+
+    if [ "$count" -eq 0 ]; then
+        echo "  - none"
     fi
 
     echo
@@ -460,6 +643,25 @@ main() {
                     exit 2
                 fi
                 FIND_MAX_DEPTH="$1"
+                ;;
+            --days)
+                shift
+                if [ $# -eq 0 ]; then
+                    print_error "--days requires a value"
+                    exit 2
+                fi
+                LOOKBACK_DAYS="$1"
+                ;;
+            --stale-days)
+                shift
+                if [ $# -eq 0 ]; then
+                    print_error "--stale-days requires a value"
+                    exit 2
+                fi
+                STALE_DAYS="$1"
+                ;;
+            --reset-week-cache)
+                RESET_WEEK_CACHE=true
                 ;;
             --no-cache)
                 USE_REPO_CACHE=false
@@ -519,6 +721,16 @@ main() {
         exit 2
     fi
 
+    if ! [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || [ "$LOOKBACK_DAYS" -lt 1 ]; then
+        print_error "days must be a positive integer"
+        exit 2
+    fi
+
+    if ! [[ "$STALE_DAYS" =~ ^[0-9]+$ ]] || [ "$STALE_DAYS" -lt 1 ]; then
+        print_error "stale days must be a positive integer"
+        exit 2
+    fi
+
     if ! [[ "$REPO_CACHE_TTL" =~ ^[0-9]+$ ]]; then
         print_error "cache TTL must be a non-negative integer"
         exit 2
@@ -549,7 +761,10 @@ main() {
     BEHIND_RAW_FILE="$(mktemp -t gh-monday.behindraw.XXXXXX)"
     REVIEWS_FILE="$(mktemp -t gh-monday.reviews.XXXXXX)"
     MENTIONS_FILE="$(mktemp -t gh-monday.mentions.XXXXXX)"
+    STALE_FILE="$(mktemp -t gh-monday.stale.XXXXXX)"
     trap cleanup EXIT
+
+    init_time_window
 
     if ! load_repo_cache; then
         scan_local_repos
@@ -565,6 +780,15 @@ main() {
     print_color "$WHITE" "repo scan max depth: $FIND_MAX_DEPTH"
     print_color "$WHITE" "behind check workers: $JOBS"
     print_color "$WHITE" "fetch remotes for behind check: $FETCH"
+    print_color "$WHITE" "activity lookback days: $LOOKBACK_DAYS"
+    print_color "$WHITE" "weekly baseline key: $WEEK_KEY"
+    print_color "$WHITE" "weekly first run: $(epoch_to_text "$WEEK_FIRST_RUN_EPOCH")"
+    print_color "$WHITE" "effective activity cutoff: $(epoch_to_text "$EVENT_CUTOFF_EPOCH")"
+    if [ "$WEEK_FIRST_RUN_IS_NEW" = "true" ]; then
+        print_color "$WHITE" "weekly baseline status: initialized on this run"
+    else
+        print_color "$WHITE" "weekly baseline status: reused cached first run"
+    fi
     echo
 
     if [ "$local_repo_count" -eq 0 ]; then
@@ -572,6 +796,7 @@ main() {
         echo
     else
         print_local_behind
+        print_cleanup_candidates
         print_local_reviews
         if [ "$SHOW_MENTIONS" = "true" ]; then
             print_local_mentions
@@ -579,8 +804,7 @@ main() {
     fi
 
     if [ "$SHOW_GLOBAL" = "true" ]; then
-        print_color "$BLUE" "Global snapshot (gh status)"
-        "$GH_REAL_BIN" status || true
+        print_global_activity
     fi
 }
 
