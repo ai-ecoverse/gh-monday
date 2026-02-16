@@ -18,15 +18,29 @@ DEBUG="${GH_MONDAY_DEBUG:-false}"
 GH_REAL_BIN="${GH_REAL_BIN:-/opt/homebrew/bin/gh}"
 LIMIT="${GH_MONDAY_LIMIT:-120}"
 ROOTS="${GH_MONDAY_ROOTS:-}"
-FETCH=true
+FETCH="${GH_MONDAY_FETCH:-false}"
 SHOW_GLOBAL=true
 SHOW_MENTIONS=true
+JOBS="${GH_MONDAY_JOBS:-8}"
+USE_REPO_CACHE=true
+REPO_CACHE_TTL="${GH_MONDAY_REPO_CACHE_TTL:-21600}"
+FIND_MAX_DEPTH="${GH_MONDAY_MAX_DEPTH:-6}"
 
 # Temp files
 LOCAL_REPOS_FILE=""
 BEHIND_FILE=""
+BEHIND_RAW_FILE=""
 REVIEWS_FILE=""
 MENTIONS_FILE=""
+
+# Cache files
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gh-monday"
+CACHE_REPOS_FILE="$CACHE_DIR/local-repos.tsv"
+CACHE_ROOTS_FILE="$CACHE_DIR/local-repos.roots"
+
+cache_key() {
+    printf '%s|%s\n' "$ROOTS" "$FIND_MAX_DEPTH"
+}
 
 print_color() {
     local color="$1"
@@ -53,7 +67,7 @@ command_exists() {
 }
 
 cleanup() {
-    rm -f "$LOCAL_REPOS_FILE" "$BEHIND_FILE" "$REVIEWS_FILE" "$MENTIONS_FILE"
+    rm -f "$LOCAL_REPOS_FILE" "$BEHIND_FILE" "$BEHIND_RAW_FILE" "$REVIEWS_FILE" "$MENTIONS_FILE"
 }
 
 resolve_gh_binary() {
@@ -123,6 +137,22 @@ parse_github_repo() {
     esac
 }
 
+file_mtime() {
+    local file="$1"
+    stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0
+}
+
+is_true() {
+    case "${1:-}" in
+        true|TRUE|1|yes|YES)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 usage() {
     cat <<'EOF'
 Usage: gh monday [options]
@@ -134,9 +164,14 @@ A local-first Monday morning triage view:
   4. Full global gh status snapshot
 
 Options:
+  --fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
   --no-fetch      Do not fetch remotes before behind/ahead checks
   --no-global     Skip the final global `gh status` section
   --no-mentions   Skip the mentions section
+  --jobs N        Parallelism for local repo checks (default: 8)
+  --max-depth N   Max directory depth when scanning for local repos (default: 6)
+  --no-cache      Disable local-repo discovery cache
+  --cache-ttl S   Cache TTL in seconds for repo discovery (default: 21600)
   --limit N       Max search results fetched per section (default: 120)
   --roots A:B:C   Colon-separated local roots to scan for repositories
   --debug         Enable debug output
@@ -146,6 +181,10 @@ Environment:
   GH_REAL_BIN       gh binary path (default: /opt/homebrew/bin/gh)
   GH_MONDAY_ROOTS   Default roots (same format as --roots)
   GH_MONDAY_LIMIT   Default limit (same as --limit)
+  GH_MONDAY_FETCH   true/false default fetch behavior (default: false)
+  GH_MONDAY_JOBS    Parallel workers for local repo checks (default: 8)
+  GH_MONDAY_MAX_DEPTH  Max scan depth for repo discovery (default: 6)
+  GH_MONDAY_REPO_CACHE_TTL  Repo cache TTL in seconds (default: 21600)
   GH_MONDAY_DEBUG   Set to true for debug output
 EOF
 }
@@ -168,47 +207,122 @@ scan_local_repos() {
             remote_url="$(git -C "$repo_dir" config --get remote.origin.url 2>/dev/null || true)"
             repo_name="$(parse_github_repo "$remote_url")"
             [ -n "$repo_name" ] || continue
-
-            if ! repo_is_local "$repo_name"; then
-                printf "%s\t%s\n" "$repo_name" "$repo_dir" >> "$LOCAL_REPOS_FILE"
-            fi
-        done < <(find "$root" -type d -name .git -prune -print 2>/dev/null)
+            printf "%s\t%s\n" "$repo_name" "$repo_dir" >> "$LOCAL_REPOS_FILE"
+        done < <(find "$root" -maxdepth "$FIND_MAX_DEPTH" -type d -name .git -prune -print 2>/dev/null)
     done
+
+    if [ -s "$LOCAL_REPOS_FILE" ]; then
+        sort -u -t "$(printf '\t')" -k1,1 "$LOCAL_REPOS_FILE" -o "$LOCAL_REPOS_FILE"
+    fi
+}
+
+cache_is_fresh() {
+    local now mtime age
+
+    if [ "$USE_REPO_CACHE" != "true" ]; then
+        return 1
+    fi
+
+    if [ ! -f "$CACHE_REPOS_FILE" ] || [ ! -f "$CACHE_ROOTS_FILE" ]; then
+        return 1
+    fi
+
+    if [ "$(cat "$CACHE_ROOTS_FILE" 2>/dev/null || true)" != "$(cache_key)" ]; then
+        return 1
+    fi
+
+    now="$(date +%s)"
+    mtime="$(file_mtime "$CACHE_REPOS_FILE")"
+    age=$((now - mtime))
+
+    [ "$age" -le "$REPO_CACHE_TTL" ]
+}
+
+load_repo_cache() {
+    if cache_is_fresh; then
+        print_debug "Using repo cache: $CACHE_REPOS_FILE"
+        cp "$CACHE_REPOS_FILE" "$LOCAL_REPOS_FILE"
+        return 0
+    fi
+    return 1
+}
+
+save_repo_cache() {
+    if [ "$USE_REPO_CACHE" != "true" ]; then
+        return 0
+    fi
+
+    mkdir -p "$CACHE_DIR"
+    cp "$LOCAL_REPOS_FILE" "$CACHE_REPOS_FILE"
+    cache_key > "$CACHE_ROOTS_FILE"
+}
+
+check_repo_state() {
+    local repo="$1"
+    local dir="$2"
+    local do_fetch="$3"
+    local upstream counts ahead behind branch
+
+    if [ "$do_fetch" = "true" ]; then
+        if ! git -C "$dir" fetch --quiet --prune origin >/dev/null 2>&1; then
+            printf "F\t%s\n" "$repo"
+        fi
+    fi
+
+    upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+    if [ -z "$upstream" ]; then
+        printf "N\t%s\n" "$repo"
+        return 0
+    fi
+
+    counts="$(git -C "$dir" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || true)"
+    if [ -z "$counts" ]; then
+        counts="0 0"
+    fi
+
+    ahead="${counts%% *}"
+    behind="${counts##* }"
+
+    if [ "$behind" -gt 0 ] 2>/dev/null; then
+        branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
+        printf "B\t%s\t%s\t%s\t%s\n" "$repo" "$branch" "$behind" "$ahead"
+    fi
 }
 
 print_local_behind() {
-    local repo dir upstream branch behind ahead
+    local repo dir
+    local running_jobs=0
     local behind_count=0
     local no_upstream_count=0
     local fetch_fail_count=0
 
     print_color "$BLUE" "Local repositories behind upstream"
 
+    : > "$BEHIND_RAW_FILE"
+    : > "$BEHIND_FILE"
+
     while IFS=$'\t' read -r repo dir; do
         [ -n "$repo" ] || continue
         [ -d "$dir" ] || continue
 
-        if [ "$FETCH" = "true" ]; then
-            if ! git -C "$dir" fetch --quiet --prune origin >/dev/null 2>&1; then
-                fetch_fail_count=$((fetch_fail_count + 1))
-            fi
-        fi
+        check_repo_state "$repo" "$dir" "$FETCH" >> "$BEHIND_RAW_FILE" &
+        running_jobs=$((running_jobs + 1))
 
-        upstream="$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-        if [ -z "$upstream" ]; then
-            no_upstream_count=$((no_upstream_count + 1))
-            continue
-        fi
-
-        behind="$(git -C "$dir" rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)"
-        ahead="$(git -C "$dir" rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)"
-
-        if [ "$behind" -gt 0 ] 2>/dev/null; then
-            branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
-            printf "  - %s (%s): behind %s, ahead %s\n" "$repo" "$branch" "$behind" "$ahead" >> "$BEHIND_FILE"
-            behind_count=$((behind_count + 1))
+        if [ "$running_jobs" -ge "$JOBS" ]; then
+            wait
+            running_jobs=0
         fi
     done < <(sort "$LOCAL_REPOS_FILE")
+
+    if [ "$running_jobs" -gt 0 ]; then
+        wait
+    fi
+
+    behind_count="$(awk -F '\t' '$1=="B"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
+    no_upstream_count="$(awk -F '\t' '$1=="N"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
+    fetch_fail_count="$(awk -F '\t' '$1=="F"{c++} END{print c+0}' "$BEHIND_RAW_FILE")"
+
+    awk -F '\t' '$1=="B"{printf "  - %s (%s): behind %s, ahead %s\n", $2, $3, $4, $5}' "$BEHIND_RAW_FILE" | sort > "$BEHIND_FILE"
 
     if [ "$behind_count" -eq 0 ]; then
         echo "  - none"
@@ -322,11 +436,41 @@ main() {
             --no-fetch)
                 FETCH=false
                 ;;
+            --fetch)
+                FETCH=true
+                ;;
             --no-global)
                 SHOW_GLOBAL=false
                 ;;
             --no-mentions)
                 SHOW_MENTIONS=false
+                ;;
+            --jobs)
+                shift
+                if [ $# -eq 0 ]; then
+                    print_error "--jobs requires a value"
+                    exit 2
+                fi
+                JOBS="$1"
+                ;;
+            --max-depth)
+                shift
+                if [ $# -eq 0 ]; then
+                    print_error "--max-depth requires a value"
+                    exit 2
+                fi
+                FIND_MAX_DEPTH="$1"
+                ;;
+            --no-cache)
+                USE_REPO_CACHE=false
+                ;;
+            --cache-ttl)
+                shift
+                if [ $# -eq 0 ]; then
+                    print_error "--cache-ttl requires a value"
+                    exit 2
+                fi
+                REPO_CACHE_TTL="$1"
                 ;;
             --limit)
                 shift
@@ -365,6 +509,27 @@ main() {
         exit 2
     fi
 
+    if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || [ "$JOBS" -lt 1 ]; then
+        print_error "jobs must be a positive integer"
+        exit 2
+    fi
+
+    if ! [[ "$FIND_MAX_DEPTH" =~ ^[0-9]+$ ]] || [ "$FIND_MAX_DEPTH" -lt 1 ]; then
+        print_error "max depth must be a positive integer"
+        exit 2
+    fi
+
+    if ! [[ "$REPO_CACHE_TTL" =~ ^[0-9]+$ ]]; then
+        print_error "cache TTL must be a non-negative integer"
+        exit 2
+    fi
+
+    if is_true "$FETCH"; then
+        FETCH=true
+    else
+        FETCH=false
+    fi
+
     if ! resolve_gh_binary; then
         print_error "could not find gh binary"
         exit 1
@@ -381,11 +546,15 @@ main() {
 
     LOCAL_REPOS_FILE="$(mktemp -t gh-monday.local.XXXXXX)"
     BEHIND_FILE="$(mktemp -t gh-monday.behind.XXXXXX)"
+    BEHIND_RAW_FILE="$(mktemp -t gh-monday.behindraw.XXXXXX)"
     REVIEWS_FILE="$(mktemp -t gh-monday.reviews.XXXXXX)"
     MENTIONS_FILE="$(mktemp -t gh-monday.mentions.XXXXXX)"
     trap cleanup EXIT
 
-    scan_local_repos
+    if ! load_repo_cache; then
+        scan_local_repos
+        save_repo_cache
+    fi
 
     local_repo_count="$(wc -l < "$LOCAL_REPOS_FILE" | tr -d ' ')"
 
@@ -393,6 +562,9 @@ main() {
     print_color "$WHITE" "gh binary: $GH_REAL_BIN"
     print_color "$WHITE" "local roots: $ROOTS"
     print_color "$WHITE" "local GitHub repos discovered: $local_repo_count"
+    print_color "$WHITE" "repo scan max depth: $FIND_MAX_DEPTH"
+    print_color "$WHITE" "behind check workers: $JOBS"
+    print_color "$WHITE" "fetch remotes for behind check: $FETCH"
     echo
 
     if [ "$local_repo_count" -eq 0 ]; then

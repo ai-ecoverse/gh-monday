@@ -26,7 +26,7 @@ cd ~/Developer/gh-monday
 
 ```bash
 cd ~/Developer/gh-monday
-/opt/homebrew/bin/gh extension upgrade monday
+./install.sh
 ```
 
 ## Usage
@@ -38,9 +38,14 @@ gh monday
 Options:
 
 ```text
+--fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
 --no-fetch      Do not fetch remotes before behind/ahead checks
 --no-global     Skip the final global `gh status` section
 --no-mentions   Skip mentions section
+--jobs N        Parallelism for local repo checks (default: 8)
+--max-depth N   Max directory depth when scanning for local repos (default: 6)
+--no-cache      Disable local repo discovery cache
+--cache-ttl S   Cache TTL in seconds for repo discovery (default: 21600)
 --limit N       Max search results fetched per section (default: 120)
 --roots A:B:C   Colon-separated local roots to scan
 --debug         Enable debug logging
@@ -53,7 +58,18 @@ Environment variables:
 - `GH_REAL_BIN` path to gh binary used by the extension (default: `/opt/homebrew/bin/gh`)
 - `GH_MONDAY_ROOTS` default roots (same format as `--roots`)
 - `GH_MONDAY_LIMIT` default limit (same as `--limit`)
+- `GH_MONDAY_FETCH` set `true` to fetch remotes by default
+- `GH_MONDAY_JOBS` parallel workers for local repo checks
+- `GH_MONDAY_MAX_DEPTH` max directory depth for repo discovery
+- `GH_MONDAY_REPO_CACHE_TTL` discovery cache TTL in seconds
 - `GH_MONDAY_DEBUG=true` enable debug output
+
+## Performance Tips
+
+- Keep `GH_MONDAY_ROOTS` narrow (for example only active work folders).
+- Leave fetch off by default and use `--fetch` only when you want freshest behind counts.
+- Increase `--jobs` on fast machines.
+- Use cache (default) so only the first run does full discovery.
 
 ## Notes
 
