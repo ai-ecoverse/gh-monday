@@ -16,19 +16,21 @@ Run `gh monday` to get a prioritized view of GitHub work needing attention.
 
 ## Running the Tool
 
-Execute:
+Execute in two steps for best UX:
 
-```bash
-gh monday 2>&1 | cat
-```
-
-Piping through `cat` strips ANSI color codes for clean parsing.
-
-For a faster check (skips fetching fresh data from GitHub, uses cache):
-
+1. **First** — Get a quick non-fetch summary (instant, uses cache):
 ```bash
 gh monday --no-fetch 2>&1 | cat
 ```
+
+2. **In parallel** — Start a background fetch for fresh data:
+```bash
+gh monday 2>&1 | cat &
+```
+
+Present the cached results first, then update if the background fetch returns meaningfully different data.
+
+Piping through `cat` strips ANSI color codes for clean parsing.
 
 See the [README.md](README.md) in this repo for the full list of CLI options and environment variables.
 
