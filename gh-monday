@@ -18,7 +18,8 @@ NC='\033[0m' # No Color
 
 # Runtime configuration
 DEBUG="${GH_MONDAY_DEBUG:-false}"
-GH_REAL_BIN="${GH_REAL_BIN:-/opt/homebrew/bin/gh}"
+# All gh calls in this script are read-only — tell am-i-ai to pass through
+export AMI_PASSTHROUGH=true
 LIMIT="${GH_MONDAY_LIMIT:-120}"
 ROOTS="${GH_MONDAY_ROOTS:-}"
 FETCH="${GH_MONDAY_FETCH:-false}"
@@ -89,16 +90,7 @@ cleanup() {
 }
 
 resolve_gh_binary() {
-    if [ -x "$GH_REAL_BIN" ]; then
-        return 0
-    fi
-
-    if command_exists gh; then
-        GH_REAL_BIN="$(command -v gh)"
-        return 0
-    fi
-
-    return 1
+    command_exists gh
 }
 
 default_roots() {
@@ -288,7 +280,6 @@ Options:
   -h, --help      Show this help
 
 Environment:
-  GH_REAL_BIN       gh binary path (default: /opt/homebrew/bin/gh)
   GH_MONDAY_ROOTS   Default roots (same format as --roots)
   GH_MONDAY_LIMIT   Default limit (same as --limit)
   GH_MONDAY_FETCH   true/false default fetch behavior (default: false)
@@ -313,7 +304,7 @@ get_local_path() {
 }
 
 get_my_username() {
-    "$GH_REAL_BIN" api user --jq '.login' 2>/dev/null || echo ""
+    gh api user --jq '.login' 2>/dev/null || echo ""
 }
 
 # Fetch all GitHub items involving the user
@@ -326,28 +317,28 @@ fetch_github_items() {
     tmp_issues="$(mktemp)"
 
     print_debug "Fetching PRs authored by me..."
-    prs_authored="$("$GH_REAL_BIN" search prs \
+    prs_authored="$(gh search prs \
         --author=@me \
         --state=open \
         --limit "$LIMIT" \
         --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
 
     print_debug "Fetching PRs where review requested..."
-    prs_review_requested="$("$GH_REAL_BIN" search prs \
+    prs_review_requested="$(gh search prs \
         --review-requested=@me \
         --state=open \
         --limit "$LIMIT" \
         --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
 
     print_debug "Fetching PRs assigned to me..."
-    prs_assigned="$("$GH_REAL_BIN" search prs \
+    prs_assigned="$(gh search prs \
         --assignee=@me \
         --state=open \
         --limit "$LIMIT" \
         --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
 
     print_debug "Fetching issues involving me..."
-    issues_involving="$("$GH_REAL_BIN" search issues \
+    issues_involving="$(gh search issues \
         --involves=@me \
         --state=open \
         --limit "$LIMIT" \
@@ -469,10 +460,10 @@ get_last_actor() {
         # For PRs, check both comments and reviews, get most recent
         local comments_data reviews_data
 
-        comments_data="$("$GH_REAL_BIN" api "repos/$repo/issues/$number/comments" \
+        comments_data="$(gh api "repos/$repo/issues/$number/comments" \
             --jq 'if length > 0 then .[-1] | {actor: .user.login, at: .created_at} else {actor: "", at: ""} end' 2>/dev/null || echo '{}')"
 
-        reviews_data="$("$GH_REAL_BIN" api "repos/$repo/pulls/$number/reviews" \
+        reviews_data="$(gh api "repos/$repo/pulls/$number/reviews" \
             --jq 'if length > 0 then .[-1] | {actor: .user.login, at: .submitted_at} else {actor: "", at: ""} end' 2>/dev/null || echo '{}')"
 
         # Compare timestamps to find most recent
@@ -500,7 +491,7 @@ get_last_actor() {
     else
         # For issues, just check comments
         local comments_data
-        comments_data="$("$GH_REAL_BIN" api "repos/$repo/issues/$number/comments" \
+        comments_data="$(gh api "repos/$repo/issues/$number/comments" \
             --jq 'if length > 0 then .[-1] | {actor: .user.login, at: .created_at} else {actor: "", at: ""} end' 2>/dev/null || echo '{}')"
 
         last_actor="$(printf '%s' "$comments_data" | jq -r '.actor // ""')"
