@@ -348,7 +348,7 @@ fetch_github_items() {
     # Priority: author > reviewer > assignee
     # Filter by activity window cutoff
     printf '%s' "$prs_authored" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select(.state == "open") | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "pr",
             .repository.nameWithOwner,
             .number,
@@ -362,7 +362,7 @@ fetch_github_items() {
     ' >> "$tmp_prs" 2>/dev/null || true
 
     printf '%s' "$prs_review_requested" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select(.state == "open") | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "pr",
             .repository.nameWithOwner,
             .number,
@@ -376,7 +376,7 @@ fetch_github_items() {
     ' >> "$tmp_prs" 2>/dev/null || true
 
     printf '%s' "$prs_assigned" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select(.state == "open") | select(.author.login != $me) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select(.author.login != $me) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "pr",
             .repository.nameWithOwner,
             .number,
@@ -391,7 +391,7 @@ fetch_github_items() {
 
     # Process issues - filter by activity window
     printf '%s' "$issues_involving" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select(.state == "open") | select(.isPullRequest == false) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select(.isPullRequest == false) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "issue",
             .repository.nameWithOwner,
             .number,
