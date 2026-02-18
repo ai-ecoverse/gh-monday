@@ -321,34 +321,34 @@ fetch_github_items() {
         --author=@me \
         --state=open \
         --limit "$LIMIT" \
-        --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
+        --json repository,number,title,url,author,updatedAt,isDraft,state 2>/dev/null || echo "[]")"
 
     print_debug "Fetching PRs where review requested..."
     prs_review_requested="$(gh search prs \
         --review-requested=@me \
         --state=open \
         --limit "$LIMIT" \
-        --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
+        --json repository,number,title,url,author,updatedAt,isDraft,state 2>/dev/null || echo "[]")"
 
     print_debug "Fetching PRs assigned to me..."
     prs_assigned="$(gh search prs \
         --assignee=@me \
         --state=open \
         --limit "$LIMIT" \
-        --json repository,number,title,url,author,updatedAt,isDraft 2>/dev/null || echo "[]")"
+        --json repository,number,title,url,author,updatedAt,isDraft,state 2>/dev/null || echo "[]")"
 
     print_debug "Fetching issues involving me..."
     issues_involving="$(gh search issues \
         --involves=@me \
         --state=open \
         --limit "$LIMIT" \
-        --json repository,number,title,url,author,updatedAt 2>/dev/null || echo "[]")"
+        --json repository,number,title,url,author,updatedAt,state,isPullRequest 2>/dev/null || echo "[]")"
 
     # Process PRs - determine role for each
     # Priority: author > reviewer > assignee
     # Filter by activity window cutoff
     printf '%s' "$prs_authored" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "pr",
             .repository.nameWithOwner,
             .number,
@@ -362,7 +362,7 @@ fetch_github_items() {
     ' >> "$tmp_prs" 2>/dev/null || true
 
     printf '%s' "$prs_review_requested" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "pr",
             .repository.nameWithOwner,
             .number,
@@ -376,7 +376,7 @@ fetch_github_items() {
     ' >> "$tmp_prs" 2>/dev/null || true
 
     printf '%s' "$prs_assigned" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select(.author.login != $me) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select(.author.login != $me) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "pr",
             .repository.nameWithOwner,
             .number,
@@ -391,7 +391,7 @@ fetch_github_items() {
 
     # Process issues - filter by activity window
     printf '%s' "$issues_involving" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select(.isPullRequest != true) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "issue",
             .repository.nameWithOwner,
             .number,
@@ -409,7 +409,7 @@ fetch_github_items() {
     cat "$tmp_prs" "$tmp_issues" | awk -F '\t' '
     BEGIN { OFS="\t" }
     {
-        key = $1 "|" $2 "|" $3
+        key = $2 "|" $3
         role = $9
         role_priority = (role == "author" ? 1 : (role == "reviewer" ? 2 : (role == "assignee" ? 3 : 4)))
         if (!(key in seen) || role_priority < seen_priority[key]) {
