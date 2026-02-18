@@ -67,7 +67,6 @@ Options:
 
 Environment variables:
 
-- `GH_REAL_BIN` path to gh binary used by the extension (default: `/opt/homebrew/bin/gh`)
 - `GH_MONDAY_ROOTS` default roots (same format as `--roots`)
 - `GH_MONDAY_LIMIT` default limit (same as `--limit`)
 - `GH_MONDAY_FETCH` set `true` to fetch remotes by default
