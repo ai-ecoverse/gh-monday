@@ -391,7 +391,7 @@ fetch_github_items() {
 
     # Process issues - filter by activity window
     printf '%s' "$issues_involving" | jq -r --arg me "$MY_USERNAME" --argjson cutoff "$EVENT_CUTOFF_EPOCH" '
-        .[] | select(.state | ascii_downcase == "open") | select(.isPullRequest == false) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
+        .[] | select(.state | ascii_downcase == "open") | select(.isPullRequest != true) | select((.updatedAt | fromdateiso8601) >= $cutoff) | [
             "issue",
             .repository.nameWithOwner,
             .number,
