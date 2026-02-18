@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 WHITE='\033[0;37m'
 NC='\033[0m'
 
-GH_BIN="$(command -v gh || true)"
+GH_BIN="$(type -P gh || true)"
 EXTENSION_NAME="monday"
 
 print_color() {
