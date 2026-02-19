@@ -31,6 +31,9 @@ LOOKBACK_DAYS="${GH_MONDAY_DAYS:-7}"
 STALE_DAYS="${GH_MONDAY_STALE_DAYS:-30}"
 RESET_WEEK_CACHE=false
 LAST_ACTOR_CACHE_TTL="${GH_MONDAY_ACTOR_CACHE_TTL:-3600}"
+NOTIFICATIONS="${GH_MONDAY_NOTIFICATIONS:-true}"
+DISMISS_NOISE=false
+MARK_DONE_THREADS=""
 
 # Current user (will be populated)
 MY_USERNAME=""
@@ -49,6 +52,8 @@ REPO_STATE_FILE=""
 GITHUB_ITEMS_FILE=""
 ENRICHED_ITEMS_FILE=""
 SCORED_ITEMS_FILE=""
+NOTIFICATIONS_FILE=""
+CATEGORIZED_NOTIFICATIONS_FILE=""
 
 # Cache directories
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gh-monday"
@@ -86,7 +91,7 @@ command_exists() {
 }
 
 cleanup() {
-    rm -f "$LOCAL_REPOS_FILE" "$REPO_STATE_FILE" "$GITHUB_ITEMS_FILE" "$ENRICHED_ITEMS_FILE" "$SCORED_ITEMS_FILE"
+    rm -f "$LOCAL_REPOS_FILE" "$REPO_STATE_FILE" "$GITHUB_ITEMS_FILE" "$ENRICHED_ITEMS_FILE" "$SCORED_ITEMS_FILE" "$NOTIFICATIONS_FILE" "$CATEGORIZED_NOTIFICATIONS_FILE"
 }
 
 resolve_gh_binary() {
@@ -262,11 +267,16 @@ Ranked GitHub triage - shows what needs your attention, prioritized by:
 Output sections:
   🔴 ACTION NEEDED    - PRs/issues where ball is in your court
   🟡 WAITING ON OTHERS - Your work waiting on someone else
+  📬 NOTIFICATIONS     - Unread GitHub notifications by priority tier
   🗑️  CLEANUP CANDIDATES - Stale local repos with no open GitHub work
 
 Options:
   --fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
   --no-fetch      Do not fetch remotes before behind/ahead checks
+  --notifications     Show notification triage section (default: on)
+  --no-notifications  Disable notification triage section
+  --dismiss-noise     Mark all noise-tier notifications as done (modifies state)
+  --mark-done ID ...  Mark specific notification thread(s) as done by thread ID
   --jobs N        Parallelism for checks (default: 8)
   --max-depth N   Max directory depth when scanning for local repos (default: 6)
   --days N        Rolling lookback window in days for activity (default: 7)
@@ -289,6 +299,7 @@ Environment:
   GH_MONDAY_STALE_DAYS  Stale repo threshold in days (default: 30)
   GH_MONDAY_REPO_CACHE_TTL  Repo cache TTL in seconds (default: 21600)
   GH_MONDAY_ACTOR_CACHE_TTL  Last-actor cache TTL in seconds (default: 3600)
+  GH_MONDAY_NOTIFICATIONS  true/false to enable/disable notification triage (default: true)
   GH_MONDAY_DEBUG   Set to true for debug output
 EOF
 }
@@ -850,6 +861,228 @@ render_cleanup_candidates() {
     echo
 }
 
+# Format a notification reason for display
+format_notification_reason() {
+    local reason="$1"
+    case "$reason" in
+        review_requested)    echo "review requested" ;;
+        approval_requested)  echo "approval requested" ;;
+        mention)             echo "mentioned" ;;
+        assign)              echo "assigned" ;;
+        author)              echo "your PR got activity" ;;
+        manual)              echo "manually subscribed" ;;
+        state_change)        echo "state changed" ;;
+        ci_activity)         echo "CI activity" ;;
+        subscribed)          echo "subscribed" ;;
+        team_mention)        echo "team mentioned" ;;
+        security_alert)      echo "security alert" ;;
+        *)                   echo "$reason" ;;
+    esac
+}
+
+# Render the notifications section
+# Reads from CATEGORIZED_NOTIFICATIONS_FILE (TSV: tier, reason, repo, title, subject_type, thread_id, url, updated_at)
+# Cross-references with SCORED_ITEMS_FILE to deduplicate items already shown in ACTION NEEDED
+render_notifications() {
+    if [ ! -s "$CATEGORIZED_NOTIFICATIONS_FILE" ]; then
+        return 0
+    fi
+
+    local total_count
+    total_count="$(wc -l < "$CATEGORIZED_NOTIFICATIONS_FILE" | tr -d ' ')"
+
+    if [ "$total_count" -eq 0 ]; then
+        return 0
+    fi
+
+    # Build set of repo+number already shown in ACTION NEEDED for dedup
+    # SCORED_ITEMS_FILE columns: score, type, repo, number, title, url, author, updated_at, is_draft, my_role, last_actor, last_at, waiting_on_me, is_local
+    local action_needed_keys=""
+    if [ -s "$SCORED_ITEMS_FILE" ]; then
+        action_needed_keys="$(awk -F '\t' '$13 == "true" { print $3 "|" $4 }' "$SCORED_ITEMS_FILE")"
+    fi
+
+    print_color "$CYAN" "📬 NOTIFICATIONS ($total_count unread)"
+    echo
+
+    # --- 🔴 ACTION NEEDED tier ---
+    local action_count=0
+    local tier reason repo title subject_type thread_id url updated_at
+    while IFS=$'\t' read -r tier reason repo title subject_type thread_id url updated_at; do
+        [ "$tier" = "action_needed" ] || continue
+        [ -n "$repo" ] || continue
+
+        # Extract number from subject URL (e.g., .../pulls/123 or .../issues/456)
+        local number="${url##*/}"
+
+        # Deduplicate: skip if already shown in ACTION NEEDED section
+        if [ -n "$action_needed_keys" ] && echo "$action_needed_keys" | grep -Fxq "${repo}|${number}"; then
+            continue
+        fi
+
+        if [ "$action_count" -eq 0 ]; then
+            printf "  ${RED}🔴 ACTION NEEDED${NC}\n"
+        fi
+        local reason_text
+        reason_text="$(format_notification_reason "$reason")"
+        printf "    ${BOLD}%s${NC} #%s — %s\n" "$repo" "$number" "$reason_text"
+        action_count=$((action_count + 1))
+    done < "$CATEGORIZED_NOTIFICATIONS_FILE"
+    if [ "$action_count" -gt 0 ]; then
+        echo
+    fi
+
+    # --- 🟡 YOUR STUFF tier ---
+    local yours_count=0
+    while IFS=$'\t' read -r tier reason repo title subject_type thread_id url updated_at; do
+        [ "$tier" = "your_stuff" ] || continue
+        [ -n "$repo" ] || continue
+
+        if [ "$yours_count" -eq 0 ]; then
+            printf "  ${YELLOW}🟡 YOUR STUFF${NC}\n"
+        fi
+        local number="${url##*/}"
+        local reason_text
+        reason_text="$(format_notification_reason "$reason")"
+        printf "    ${BOLD}%s${NC} #%s — %s\n" "$repo" "$number" "$reason_text"
+        yours_count=$((yours_count + 1))
+    done < "$CATEGORIZED_NOTIFICATIONS_FILE"
+    if [ "$yours_count" -gt 0 ]; then
+        echo
+    fi
+
+    # --- 🟠 STATE CHANGES tier ---
+    local state_count=0
+    while IFS=$'\t' read -r tier reason repo title subject_type thread_id url updated_at; do
+        [ "$tier" = "state_changes" ] || continue
+        [ -n "$repo" ] || continue
+
+        if [ "$state_count" -eq 0 ]; then
+            printf "  ${YELLOW}🟠 STATE CHANGES${NC}\n"
+        fi
+        local number="${url##*/}"
+        local reason_text
+        reason_text="$(format_notification_reason "$reason")"
+        printf "    ${BOLD}%s${NC} #%s — %s\n" "$repo" "$number" "$reason_text"
+        state_count=$((state_count + 1))
+    done < "$CATEGORIZED_NOTIFICATIONS_FILE"
+    if [ "$state_count" -gt 0 ]; then
+        echo
+    fi
+
+    # --- 🟢 NOISE tier (repo-grouped counts) ---
+    local noise_lines
+    noise_lines="$(awk -F '\t' '$1 == "noise" && $3 != "" { print $3 "\t" $2 }' "$CATEGORIZED_NOTIFICATIONS_FILE")"
+    if [ -n "$noise_lines" ]; then
+        local noise_count
+        noise_count="$(echo "$noise_lines" | wc -l | tr -d ' ')"
+        printf "  ${GREEN}🟢 NOISE (%d — run with --dismiss-noise to mark done)${NC}\n" "$noise_count"
+        # Group by repo with count and most common reason, sorted by count descending
+        echo "$noise_lines" | awk -F '\t' '
+        {
+            repo = $1
+            reason = $2
+            repo_count[repo]++
+            repo_reason[repo] = reason
+        }
+        END {
+            for (repo in repo_count) {
+                printf "%d\t%s\t%s\n", repo_count[repo], repo, repo_reason[repo]
+            }
+        }
+        ' | sort -t $'\t' -k1,1nr | while IFS=$'\t' read -r cnt rp rsn; do
+            printf "    %s — %d %s\n" "$rp" "$cnt" "$rsn"
+        done
+        echo
+    fi
+
+    # Show nothing message if all were deduped
+    local shown=$((action_count + yours_count + state_count))
+    if [ "$shown" -eq 0 ] && [ -z "$noise_lines" ]; then
+        echo "  (all notifications already shown in other sections)"
+        echo
+    fi
+
+    # Render noisy repo suggestions
+    render_noisy_repos
+}
+
+# Detect repos with high notification frequency but low user engagement
+# A repo is "noisy" if it has 5+ noise-tier notifications and zero
+# action_needed/your_stuff notifications in the current batch.
+# Also excludes repos where the user has open PRs/issues (from SCORED_ITEMS_FILE).
+# Output: TSV lines of noisy_repo\tnotification_count to stdout
+detect_noisy_repos() {
+    if [ ! -s "$CATEGORIZED_NOTIFICATIONS_FILE" ]; then
+        return 0
+    fi
+
+    # Count noise-tier notifications per repo
+    local noise_repos
+    noise_repos="$(awk -F '\t' '$1 == "noise" && $3 != "" { count[$3]++ } END { for (r in count) print r "\t" count[r] }' "$CATEGORIZED_NOTIFICATIONS_FILE")"
+
+    if [ -z "$noise_repos" ]; then
+        return 0
+    fi
+
+    # Build set of repos that have action_needed or your_stuff notifications
+    local engaged_repos
+    engaged_repos="$(awk -F '\t' '($1 == "action_needed" || $1 == "your_stuff") && $3 != "" { print $3 }' "$CATEGORIZED_NOTIFICATIONS_FILE" | sort -u)"
+
+    # Build set of repos where user has open PRs/issues
+    local active_repos=""
+    if [ -s "$SCORED_ITEMS_FILE" ]; then
+        active_repos="$(awk -F '\t' '{ print $3 }' "$SCORED_ITEMS_FILE" | sort -u)"
+    fi
+
+    # Filter: keep only repos with 5+ noise notifications, zero engaged notifications, and no active work
+    echo "$noise_repos" | while IFS=$'\t' read -r repo count; do
+        [ -n "$repo" ] || continue
+        [ "$count" -ge 5 ] || continue
+
+        # Skip if repo has action_needed or your_stuff notifications
+        if [ -n "$engaged_repos" ] && echo "$engaged_repos" | grep -Fxq "$repo"; then
+            continue
+        fi
+
+        # Skip if repo has open PRs/issues involving the user
+        if [ -n "$active_repos" ] && echo "$active_repos" | grep -Fxq "$repo"; then
+            continue
+        fi
+
+        printf '%s\t%s\n' "$repo" "$count"
+    done | sort -t $'\t' -k2,2nr
+}
+
+# Render noisy repo suggestions with unsubscribe commands
+# Called at the end of render_notifications()
+render_noisy_repos() {
+    local noisy_repos
+    noisy_repos="$(detect_noisy_repos)"
+
+    if [ -z "$noisy_repos" ]; then
+        return 0
+    fi
+
+    printf "  ${DIM}🔕 NOISY REPOS (consider unsubscribing)${NC}\n"
+
+    local repo count node_id
+    while IFS=$'\t' read -r repo count; do
+        [ -n "$repo" ] || continue
+
+        # Look up the repository node_id from the raw notifications JSON
+        node_id="$(jq -r --arg repo "$repo" '
+            [.[] | select(.repository.full_name == $repo)] | first | .repository.node_id // ""
+        ' "$NOTIFICATIONS_FILE")"
+
+        printf "    %s — %d noise notifications\n" "$repo" "$count"
+        if [ -n "$node_id" ]; then
+            printf "    ${DIM}gh api graphql -f query='mutation { updateSubscription(input: {subscribableId: \"%s\", state: IGNORED}) { subscribable { id } } }'${NC}\n" "$node_id"
+        fi
+    done <<< "$noisy_repos"
+    echo
+}
+
 # Render local repos behind upstream (quick status)
 render_local_behind() {
     local repo dir behind_count=0
@@ -1020,6 +1253,150 @@ render_ai_sessions() {
     echo
 }
 
+# Fetch all unread GitHub notifications
+# Output: raw JSON array written to NOTIFICATIONS_FILE
+fetch_notifications() {
+    print_debug "Fetching notifications..."
+
+    local raw_json
+    raw_json="$(gh api notifications --method GET \
+        -F all=false \
+        -F per_page=50 \
+        --paginate 2>/dev/null || echo "[]")"
+
+    # --paginate returns one JSON array per page; merge them
+    printf '%s' "$raw_json" | jq -s 'add // []' > "$NOTIFICATIONS_FILE"
+
+    local count
+    count="$(jq 'length' "$NOTIFICATIONS_FILE")"
+    print_debug "Fetched $count notifications"
+}
+
+# Categorize notifications by reason into four tiers
+# Reads NOTIFICATIONS_FILE, outputs TSV to stdout:
+#   tier|reason|repo|title|subject_type|thread_id|url|updated_at
+# Tiers: action_needed, your_stuff, state_changes, noise
+categorize_notifications() {
+    jq -r '
+        def tier:
+            if . == "review_requested" or . == "mention" or . == "assign" or . == "approval_requested" then
+                "action_needed"
+            elif . == "author" or . == "manual" then
+                "your_stuff"
+            elif . == "state_change" or . == "ci_activity" then
+                "state_changes"
+            else
+                "noise"
+            end;
+
+        .[] | [
+            (.reason | tier),
+            .reason,
+            .repository.full_name,
+            .subject.title,
+            .subject.type,
+            .id,
+            .subject.url,
+            .updated_at
+        ] | @tsv
+    ' "$NOTIFICATIONS_FILE"
+}
+
+# Check if auth token supports the notifications API
+# Fine-grained PATs (github_pat_) don't support notifications; classic PATs (ghp_) and OAuth tokens do
+check_auth_token() {
+    local token
+    token="$(gh auth token 2>/dev/null || true)"
+
+    if [ -z "$token" ]; then
+        print_warn "Could not detect auth token. Notification operations may fail."
+        return 0
+    fi
+
+    case "$token" in
+        github_pat_*)
+            print_warn "Fine-grained PAT detected — notifications API requires a classic token (ghp_) or OAuth token."
+            print_warn "Notification dismiss/mark-done operations will likely fail."
+            ;;
+        ghs_*)
+            print_warn "GitHub App token detected — notifications API requires a user token."
+            print_warn "Notification dismiss/mark-done operations will likely fail."
+            ;;
+    esac
+}
+
+# Mark all noise-tier notifications as done
+# Reads from CATEGORIZED_NOTIFICATIONS_FILE (TSV: tier, reason, repo, title, subject_type, thread_id, url, updated_at)
+dismiss_noise_notifications() {
+    if [ ! -s "$CATEGORIZED_NOTIFICATIONS_FILE" ]; then
+        echo "No categorized notifications found. Run without --dismiss-noise first to fetch notifications."
+        return 0
+    fi
+
+    local noise_ids=()
+    local tier reason repo title subject_type thread_id url updated_at
+    while IFS=$'\t' read -r tier reason repo title subject_type thread_id url updated_at; do
+        [ "$tier" = "noise" ] || continue
+        [ -n "$thread_id" ] || continue
+        noise_ids+=("$thread_id")
+    done < "$CATEGORIZED_NOTIFICATIONS_FILE"
+
+    local count=${#noise_ids[@]}
+    if [ "$count" -eq 0 ]; then
+        echo "No noise-tier notifications to dismiss."
+        return 0
+    fi
+
+    printf "Marking %d noise notifications as done...\n" "$count"
+
+    local dismissed=0 failed=0
+    for thread_id in "${noise_ids[@]}"; do
+        if (AMI_PASSTHROUGH= gh api --method DELETE "notifications/threads/$thread_id" 2>/dev/null); then
+            dismissed=$((dismissed + 1))
+        else
+            failed=$((failed + 1))
+            print_debug "Failed to dismiss thread $thread_id"
+        fi
+    done
+
+    printf "Done: %d dismissed" "$dismissed"
+    if [ "$failed" -gt 0 ]; then
+        printf ", %d failed" "$failed"
+    fi
+    printf "\n"
+}
+
+# Mark specific notification threads as done
+# Args: space-separated thread IDs in MARK_DONE_THREADS
+mark_done_threads() {
+    local ids_string="$1"
+    local ids=()
+    read -r -a ids <<< "$ids_string"
+
+    local count=${#ids[@]}
+    if [ "$count" -eq 0 ]; then
+        return 0
+    fi
+
+    printf "Marking %d notification(s) as done...\n" "$count"
+
+    local dismissed=0 failed=0
+    for thread_id in "${ids[@]}"; do
+        if (AMI_PASSTHROUGH= gh api --method DELETE "notifications/threads/$thread_id" 2>/dev/null); then
+            dismissed=$((dismissed + 1))
+        else
+            failed=$((failed + 1))
+            print_warn "Failed to dismiss thread $thread_id"
+        fi
+    done
+
+    printf "Done: %d dismissed" "$dismissed"
+    if [ "$failed" -gt 0 ]; then
+        printf ", %d failed" "$failed"
+    fi
+    printf "\n"
+}
+
 main() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1028,6 +1405,32 @@ main() {
                 ;;
             --fetch)
                 FETCH=true
+                ;;
+            --notifications)
+                NOTIFICATIONS=true
+                ;;
+            --no-notifications)
+                NOTIFICATIONS=false
+                ;;
+            --dismiss-noise)
+                DISMISS_NOISE=true
+                NOTIFICATIONS=true
+                ;;
+            --mark-done)
+                shift
+                if [ $# -eq 0 ]; then
+                    print_error "--mark-done requires at least one thread ID"
+                    exit 2
+                fi
+                while [ $# -gt 0 ] && [[ "$1" != --* ]]; do
+                    if [ -n "$MARK_DONE_THREADS" ]; then
+                        MARK_DONE_THREADS="$MARK_DONE_THREADS $1"
+                    else
+                        MARK_DONE_THREADS="$1"
+                    fi
+                    shift
+                done
+                continue
                 ;;
             --jobs)
                 shift
@@ -1143,6 +1546,12 @@ main() {
         FETCH=false
     fi
 
+    if is_true "$NOTIFICATIONS"; then
+        NOTIFICATIONS=true
+    else
+        NOTIFICATIONS=false
+    fi
+
     if ! resolve_gh_binary; then
         print_error "could not find gh binary"
         exit 1
@@ -1163,12 +1572,27 @@ main() {
         exit 1
     fi
 
+    # Check auth token if write operations are requested
+    if [ "$DISMISS_NOISE" = "true" ] || [ -n "$MARK_DONE_THREADS" ]; then
+        check_auth_token
+    fi
+
+    # Handle --mark-done early (no triage needed)
+    if [ -n "$MARK_DONE_THREADS" ]; then
+        mark_done_threads "$MARK_DONE_THREADS"
+        if [ "$DISMISS_NOISE" != "true" ]; then
+            exit 0
+        fi
+    fi
+
     # Create temp files
     LOCAL_REPOS_FILE="$(mktemp -t gh-monday.local.XXXXXX)"
     REPO_STATE_FILE="$(mktemp -t gh-monday.repostate.XXXXXX)"
     GITHUB_ITEMS_FILE="$(mktemp -t gh-monday.github.XXXXXX)"
     ENRICHED_ITEMS_FILE="$(mktemp -t gh-monday.enriched.XXXXXX)"
     SCORED_ITEMS_FILE="$(mktemp -t gh-monday.scored.XXXXXX)"
+    NOTIFICATIONS_FILE="$(mktemp -t gh-monday.notifications.XXXXXX)"
+    CATEGORIZED_NOTIFICATIONS_FILE="$(mktemp -t gh-monday.catnotif.XXXXXX)"
     trap cleanup EXIT
 
     init_time_window
@@ -1197,6 +1621,24 @@ main() {
     github_item_count="$(wc -l < "$GITHUB_ITEMS_FILE" | tr -d ' ')"
     print_debug "Found $github_item_count GitHub items"
 
+    # Phase 2b: Fetch and categorize notifications
+    if [ "$NOTIFICATIONS" = "true" ]; then
+        print_debug "Phase 2b: Fetching notifications..."
+        fetch_notifications
+        local notif_count
+        notif_count="$(jq 'length' "$NOTIFICATIONS_FILE")"
+        print_debug "Found $notif_count notifications"
+
+        print_debug "Categorizing notifications..."
+        categorize_notifications > "$CATEGORIZED_NOTIFICATIONS_FILE"
+        print_debug "Categorization complete"
+
+        # Dismiss noise if requested
+        if [ "$DISMISS_NOISE" = "true" ]; then
+            dismiss_noise_notifications
+        fi
+    fi
+
     # Phase 3: Enrich with last actor
     print_debug "Phase 3: Enriching with last actor info..."
     enrich_with_last_actor > "$ENRICHED_ITEMS_FILE"
@@ -1220,6 +1662,9 @@ main() {
     # Render sections
     render_action_needed
     render_waiting_on_others
+    if [ "$NOTIFICATIONS" = "true" ]; then
+        render_notifications
+    fi
     render_local_behind
     render_ai_sessions
     render_cleanup_candidates
