@@ -913,10 +913,13 @@ render_notifications() {
         [ -n "$repo" ] || continue
 
         # Extract number from subject URL (e.g., .../pulls/123 or .../issues/456)
-        local number="${url##*/}"
+        local number=""
+        if [ -n "$url" ]; then
+            number="${url##*/}"
+        fi
 
         # Deduplicate: skip if already shown in ACTION NEEDED section
-        if [ -n "$action_needed_keys" ] && echo "$action_needed_keys" | grep -Fxq "${repo}|${number}"; then
+        if [ -n "$number" ] && [ -n "$action_needed_keys" ] && echo "$action_needed_keys" | grep -Fxq "${repo}|${number}"; then
             continue
         fi
 
@@ -925,7 +928,8 @@ render_notifications() {
         fi
         local reason_text
         reason_text="$(format_notification_reason "$reason")"
-        printf "    ${BOLD}%s${NC} #%s — %s\n" "$repo" "$number" "$reason_text"
+        local display_id="${number:+#$number}"
+        printf "    ${BOLD}%s${NC} %s — %s\n" "$repo" "$display_id" "$reason_text"
         action_count=$((action_count + 1))
     done < "$CATEGORIZED_NOTIFICATIONS_FILE"
     if [ "$action_count" -gt 0 ]; then
@@ -941,10 +945,14 @@ render_notifications() {
         if [ "$yours_count" -eq 0 ]; then
             printf "  ${YELLOW}🟡 YOUR STUFF${NC}\n"
         fi
-        local number="${url##*/}"
+        local number=""
+        if [ -n "$url" ]; then
+            number="${url##*/}"
+        fi
         local reason_text
         reason_text="$(format_notification_reason "$reason")"
-        printf "    ${BOLD}%s${NC} #%s — %s\n" "$repo" "$number" "$reason_text"
+        local display_id="${number:+#$number}"
+        printf "    ${BOLD}%s${NC} %s — %s\n" "$repo" "$display_id" "$reason_text"
         yours_count=$((yours_count + 1))
     done < "$CATEGORIZED_NOTIFICATIONS_FILE"
     if [ "$yours_count" -gt 0 ]; then
@@ -960,10 +968,14 @@ render_notifications() {
         if [ "$state_count" -eq 0 ]; then
             printf "  ${YELLOW}🟠 STATE CHANGES${NC}\n"
         fi
-        local number="${url##*/}"
+        local number=""
+        if [ -n "$url" ]; then
+            number="${url##*/}"
+        fi
         local reason_text
         reason_text="$(format_notification_reason "$reason")"
-        printf "    ${BOLD}%s${NC} #%s — %s\n" "$repo" "$number" "$reason_text"
+        local display_id="${number:+#$number}"
+        printf "    ${BOLD}%s${NC} %s — %s\n" "$repo" "$display_id" "$reason_text"
         state_count=$((state_count + 1))
     done < "$CATEGORIZED_NOTIFICATIONS_FILE"
     if [ "$state_count" -gt 0 ]; then
@@ -1262,7 +1274,10 @@ fetch_notifications() {
     raw_json="$(gh api notifications --method GET \
         -F all=false \
         -F per_page=50 \
-        --paginate 2>/dev/null || echo "[]")"
+        --paginate 2>/dev/null)" || {
+        print_warn "Failed to fetch GitHub notifications. Check your authentication (gh auth status)."
+        raw_json="[]"
+    }
 
     # --paginate returns one JSON array per page; merge them
     printf '%s' "$raw_json" | jq -s 'add // []' > "$NOTIFICATIONS_FILE"
@@ -1296,7 +1311,7 @@ categorize_notifications() {
             .subject.title,
             .subject.type,
             .id,
-            .subject.url,
+            (.subject.url // ""),
             .updated_at
         ] | @tsv
     ' "$NOTIFICATIONS_FILE"
@@ -1355,7 +1370,7 @@ dismiss_noise_notifications() {
             dismissed=$((dismissed + 1))
         else
             failed=$((failed + 1))
-            print_debug "Failed to dismiss thread $thread_id"
+            print_warn "Failed to dismiss thread $thread_id"
         fi
     done
 
@@ -1430,6 +1445,10 @@ main() {
                     fi
                     shift
                 done
+                if [ -z "$MARK_DONE_THREADS" ]; then
+                    printf '%b\n' "${RED}Error:${NC} --mark-done requires at least one thread ID" >&2
+                    exit 1
+                fi
                 continue
                 ;;
             --jobs)
@@ -1550,6 +1569,12 @@ main() {
         NOTIFICATIONS=true
     else
         NOTIFICATIONS=false
+    fi
+
+    # --dismiss-noise requires notifications even if --no-notifications was passed
+    if [ "$DISMISS_NOISE" = "true" ] && [ "$NOTIFICATIONS" = "false" ]; then
+        NOTIFICATIONS=true
+        print_debug "--dismiss-noise overrides --no-notifications"
     fi
 
     if ! resolve_gh_binary; then
