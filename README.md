@@ -63,6 +63,10 @@ gh monday
 ```text
 --fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
 --no-fetch      Do not fetch remotes before behind/ahead checks
+--notifications     Show notification triage section (default: on)
+--no-notifications  Disable notification triage section
+--dismiss-noise     Mark all noise-tier notifications as done (modifies state)
+--mark-done ID ...  Mark specific notification thread(s) as done by thread ID
 --jobs N        Parallelism for checks (default: 8)
 --max-depth N   Max directory depth when scanning for local repos (default: 6)
 --days N        Rolling lookback window in days for activity (default: 7)
@@ -71,10 +75,6 @@ gh monday
 --no-cache      Disable local repo discovery cache
 --cache-ttl S   Cache TTL in seconds for repo discovery (default: 21600)
 --limit N       Max search results fetched per section (default: 120)
---notifications     Show notification triage section (default: on)
---no-notifications  Hide notification triage section
---dismiss-noise     Mark noise-tier notifications as done (modifies state)
---mark-done IDs     Mark specific notification thread IDs as done
 --roots A:B:C   Colon-separated local roots to scan
 --debug         Enable debug logging
 ```
