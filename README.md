@@ -140,7 +140,13 @@ gh-monday fetches your unread GitHub notifications and categorizes them into fou
 If a repository generates many notifications you rarely engage with, gh-monday suggests unsubscribe commands:
 
 ```bash
-gh api -X PUT repos/OWNER/REPO/subscription -f ignored=true
+gh api graphql -f query='
+  mutation($subId: ID!) {
+    updateSubscription(input: { subscribableId: $subId, state: IGNORED }) {
+      subscribable { id }
+    }
+  }
+' -F subId=REPO_NODE_ID
 ```
 
 ### Authentication
