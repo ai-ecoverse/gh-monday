@@ -218,7 +218,7 @@ export GH_MONDAY_ROOTS="$HOME/Developer:$HOME/projects"
 
 ### Empty notification section / "[WARN] Failed to fetch GitHub notifications"
 
-The notifications API requires a classic PAT with `notifications` scope. Fine-grained PATs are not supported.
+The notifications API requires either an OAuth token (e.g. from `gh auth login`) or a classic PAT with `notifications` scope. Fine-grained PATs are not supported.
 Check your token:
 ```bash
 gh auth status
