@@ -7,12 +7,15 @@ description: |
   (3) checking what needs attention, (4) reviewing PR queue, (5) finding stale work.
   Triggers on: "what should I work on", "Monday morning", "triage my GitHub",
   "what needs my attention", "check my PRs", "review queue", "It's Monday again",
-  "weekly triage", "what's waiting on me", "GitHub status", "open PRs".
+  "weekly triage", "what's waiting on me", "GitHub status", "open PRs",
+  "clean my inbox", "dismiss noise", "notification triage", "unread notifications".
 ---
 
 # gh-monday — GitHub Triage Skill
 
-Run `gh monday` to get a prioritized view of GitHub work needing attention.
+Mondays are an opportunity to delegate and delete.
+
+Run `gh monday` to get a prioritized view of GitHub work needing attention — PRs, issues, and notifications — then dismiss the noise, act on what matters, and unsubscribe from what doesn't.
 
 ## Running the Tool
 
@@ -32,11 +35,13 @@ Present the cached results first, then update if the background fetch returns me
 
 Piping through `cat` strips ANSI color codes for clean parsing.
 
+Notifications are included by default. To skip them: `gh monday --no-notifications`.
+
 See the [README.md](README.md) in this repo for the full list of CLI options and environment variables.
 
 ## Parsing the Output
 
-The output has 5 sections. Handle each differently:
+The output has 6 sections. Handle each differently:
 
 ### 🔴 ACTION NEEDED (waiting on you) — PRIMARY FOCUS
 
@@ -54,6 +59,24 @@ Items where someone else acted last — the ball is in the user's court. Each it
 ### 🟡 WAITING ON OTHERS (ball in their court) — FYI only
 
 Items where the user acted last. Mention briefly: "N items waiting on others" with a short list. No action needed.
+
+### 📬 NOTIFICATIONS — triage by tier
+
+Unread GitHub notifications, categorized into four tiers:
+
+- **🔴 ACTION NEEDED** — `review_requested`, `mention`, `assign`, `approval_requested`. Items requiring your response. Cross-referenced with the main ACTION NEEDED section to avoid duplicates.
+- **🟡 YOUR STUFF** — `author`, `manual`. Activity on your own PRs/issues.
+- **🟠 STATE CHANGES** — `state_change`, `ci_activity`. Merges, closures, CI results.
+- **🟢 NOISE** — `subscribed`, `team_mention`, everything else. Shown as repo-grouped counts with a hint to run `--dismiss-noise`.
+
+**After the tiers, look for:**
+- **🔕 NOISY REPOS** — Repos with 5+ noise notifications and zero engagement. Each includes a `gh api graphql` mutation command to unsubscribe.
+
+**How to present notifications:**
+- Lead with 🔴 tier items — these are your action items
+- Mention 🟡 and 🟠 tiers briefly (counts + notable items)
+- For 🟢 noise: report count and offer to dismiss with `--dismiss-noise`
+- For 🔕 noisy repos: suggest unsubscribing and offer to run the provided commands
 
 ### 📥 LOCAL REPOS BEHIND UPSTREAM — brief mention
 
@@ -77,6 +100,25 @@ Provide a concise summary:
 
 If the 🔴 section is empty, lead with "All clear! Nothing needs your attention right now." and briefly mention the other sections.
 
+## Notification Triage Workflow
+
+After presenting the initial dashboard, guide the user through notification triage:
+
+1. **Dismiss noise** — If there are 🟢 NOISE notifications, offer to clean them up:
+```bash
+gh monday --dismiss-noise 2>&1 | cat
+```
+This marks all noise-tier notifications as done on GitHub. It's safe — these are `subscribed`, `team_mention`, and other low-signal reasons.
+
+2. **Mark specific threads done** — If the user wants to dismiss individual notifications:
+```bash
+gh monday --mark-done THREAD_ID1 THREAD_ID2 2>&1 | cat
+```
+
+3. **Unsubscribe from noisy repos** — If 🔕 NOISY REPOS are listed, suggest running the provided `gh api graphql` mutation commands. Explain that this stops future notifications from repos where the user has no active work and only receives noise.
+
+4. **Act on what matters** — From the 🔴 tiers (both main ACTION NEEDED and notification ACTION NEEDED), help the user with concrete next steps: review a PR, respond to an issue, or address a mention.
+
 ## Error Handling
 
 **Not installed:**
@@ -91,6 +133,11 @@ Could not determine GitHub username
 ```
 → Suggest: Run `gh auth status` to check authentication, then `gh auth login` if needed.
 
+**Fine-grained PAT warning:**
+```
+Fine-grained PAT detected — notifications API requires a classic token (ghp_) or OAuth token.
+```
+→ Explain that GitHub fine-grained PATs (`github_pat_*`) don't support the notifications API. Suggest running `gh auth login` to switch to an OAuth token, or using `--no-notifications` to skip the notification section.
+
 **Empty results (all sections show "(none)"):**
 → "All clear! Nothing needs your attention right now."
-
