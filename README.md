@@ -179,7 +179,7 @@ gh-monday sets `AMI_PASSTHROUGH=true` when running, so it works correctly throug
 - `gh` CLI (authenticated)
 - `jq` for JSON processing
 - `git`
-- **Notifications**: classic PAT with `notifications` scope (fine-grained PATs not supported)
+- **Notifications**: classic PAT (`ghp_`) or OAuth token with `notifications` scope; fine-grained PATs not supported
 
 ## 🚧 Troubleshooting
 
