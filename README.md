@@ -14,6 +14,7 @@ Run one command and get:
 - **🟡 WAITING ON OTHERS** — your work where you acted last (ball in their court)
 - **📥 LOCAL REPOS BEHIND** — local checkouts that need to sync
 - **🤖 AI CODING SESSIONS** — recent Claude Code and Codex sessions you might want to resume
+- **📬 NOTIFICATIONS** — categorized by urgency: action needed, your stuff, state changes, noise
 - **🗑️ CLEANUP CANDIDATES** — stale local repos with no open GitHub work
 
 ## 🎯 Why This Exists
@@ -62,6 +63,10 @@ gh monday
 ```text
 --fetch         Fetch remotes before behind/ahead checks (slower, freshest counts)
 --no-fetch      Do not fetch remotes before behind/ahead checks
+--notifications     Show notification triage section (default: on)
+--no-notifications  Disable notification triage section
+--dismiss-noise     Mark all noise-tier notifications as done (modifies state)
+--mark-done ID ...  Mark specific notification thread(s) as done by thread ID
 --jobs N        Parallelism for checks (default: 8)
 --max-depth N   Max directory depth when scanning for local repos (default: 6)
 --days N        Rolling lookback window in days for activity (default: 7)
@@ -89,6 +94,7 @@ Environment variables:
 | `GH_MONDAY_STALE_DAYS` | Stale repo threshold in days | `30` |
 | `GH_MONDAY_REPO_CACHE_TTL` | Discovery cache TTL in seconds | `21600` |
 | `GH_MONDAY_ACTOR_CACHE_TTL` | Last-actor cache TTL in seconds | `3600` |
+| `GH_MONDAY_NOTIFICATIONS` | Show notification triage section | `true` |
 | `GH_MONDAY_DEBUG` | Enable debug output | `false` |
 
 ## 🔍 How It Works
@@ -98,7 +104,8 @@ Environment variables:
 3. **Enrich with last actor** — checks who commented/reviewed last on each item (cached)
 4. **Score and rank** — applies the ranking algorithm
 5. **Find AI sessions** — scans Claude Code and Codex session history for recent work
-6. **Display** — shows ranked results in priority order
+6. **Fetch notifications** — retrieves unread GitHub notifications via REST API, categorizes by reason into 4 tiers
+7. **Display** — shows ranked results in priority order
 
 ## 🤖 AI Sessions Integration
 
@@ -118,6 +125,33 @@ To resume a session:
 Environment variables:
 - `AI_SESSION_DAYS` — how far back to look for sessions (default: 7)
 - `AI_SESSION_MAX` — maximum sessions to scan per tool (default: 15)
+
+## 📬 Notification Triage
+
+gh-monday fetches your unread GitHub notifications and categorizes them into four priority tiers:
+
+- **🔴 Action Needed** — review requests, direct mentions, assignments
+- **🟡 Your Stuff** — activity on PRs/issues you authored
+- **🟠 State Changes** — CI activity, state transitions (this tier may not appear if empty)
+- **🟢 Noise** — subscribed, team mentions — can be bulk-dismissed with `--dismiss-noise`
+
+### Noisy Repo Detection
+
+If a repository generates many notifications you rarely engage with, gh-monday suggests unsubscribe commands:
+
+```bash
+gh api graphql -f query='
+  mutation($subId: ID!) {
+    updateSubscription(input: { subscribableId: $subId, state: IGNORED }) {
+      subscribable { id }
+    }
+  }
+' -F subId=REPO_NODE_ID
+```
+
+### Authentication
+
+The notifications API requires a **classic PAT** (or OAuth token) with the `notifications` scope. Fine-grained PATs are not supported for notifications.
 
 ## 🧠 AI Agent Integration
 
@@ -151,6 +185,7 @@ gh-monday sets `AMI_PASSTHROUGH=true` when running, so it works correctly throug
 - `gh` CLI (authenticated)
 - `jq` for JSON processing
 - `git`
+- **Notifications**: classic PAT (`ghp_`) or OAuth token with `notifications` scope; fine-grained PATs not supported
 
 ## 🚧 Troubleshooting
 
@@ -185,6 +220,14 @@ sudo apt-get install jq
 Make sure `GH_MONDAY_ROOTS` points to directories containing your git checkouts:
 ```bash
 export GH_MONDAY_ROOTS="$HOME/Developer:$HOME/projects"
+```
+
+### Empty notification section / "[WARN] Failed to fetch GitHub notifications"
+
+The notifications API requires either an OAuth token (e.g. from `gh auth login`) or a classic PAT with `notifications` scope. Fine-grained PATs are not supported.
+Check your token:
+```bash
+gh auth status
 ```
 
 ### Stale cache
