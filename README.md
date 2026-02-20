@@ -216,7 +216,7 @@ Make sure `GH_MONDAY_ROOTS` points to directories containing your git checkouts:
 export GH_MONDAY_ROOTS="$HOME/Developer:$HOME/projects"
 ```
 
-### Empty notification section / "Warning: Failed to fetch notifications"
+### Empty notification section / "[WARN] Failed to fetch GitHub notifications"
 
 The notifications API requires a classic PAT with `notifications` scope. Fine-grained PATs are not supported.
 Check your token:
