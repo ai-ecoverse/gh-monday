@@ -1,7 +1,7 @@
 # 🐱 gh-monday
 
-[![90% Vibe_Coded](https://img.shields.io/badge/90%25-Vibe_Coded-ff69b4?style=for-the-badge&logo=claude&logoColor=white)](https://github.com/trieloff/vibe-coded-badge-action)
-[![Part of AI Ecoverse](https://img.shields.io/badge/AI-Ecoverse-blue?style=for-the-badge)](https://github.com/trieloff/ai-ecoverse)
+[![90% Vibe_Coded](https://img.shields.io/badge/90%25-Vibe_Coded-ff69b4?style=for-the-badge&logo=claude&logoColor=white)](https://github.com/ai-ecoverse/vibe-coded-badge-action)
+[![Part of AI Ecoverse](https://img.shields.io/badge/AI-Ecoverse-blue?style=for-the-badge)](https://github.com/ai-ecoverse/.github)
 
 ![A robot cat that loves Mondays](hero-banner.jpg)
 
@@ -35,7 +35,7 @@ It also applies a time window:
 ## 🚀 Install
 
 ```bash
-gh extension install trieloff/gh-monday
+gh extension install ai-ecoverse/gh-monday
 ```
 
 ### Local Development
@@ -155,10 +155,10 @@ The notifications API requires a **classic PAT** (or OAuth token) with the `noti
 
 ## 🧠 AI Agent Integration
 
-gh-monday ships with a [SKILL.md](SKILL.md) that teaches AI coding agents how to run and interpret triage results. Install it with [upskill](https://github.com/trieloff/upskill):
+gh-monday ships with a [SKILL.md](SKILL.md) that teaches AI coding agents how to run and interpret triage results. Install it with [upskill](https://github.com/ai-ecoverse/gh-upskill):
 
 ```bash
-upskill -g trieloff/gh-monday --all
+upskill -g ai-ecoverse/gh-monday --all
 ```
 
 Once installed, your AI agent can respond to prompts like:
@@ -170,7 +170,7 @@ The skill teaches the agent to run `gh monday 2>&1 | cat`, parse the five output
 
 ### Passthrough Mode
 
-gh-monday sets `AMI_PASSTHROUGH=true` when running, so it works correctly through [ai-aligned-gh](https://github.com/trieloff/ai-aligned-gh). This ensures triage commands (which are read-only) bypass bot token exchange and use your personal token directly.
+gh-monday sets `AMI_PASSTHROUGH=true` when running, so it works correctly through [ai-aligned-gh](https://github.com/ai-ecoverse/ai-aligned-gh). This ensures triage commands (which are read-only) bypass bot token exchange and use your personal token directly.
 
 ## ⚡ Performance Tips
 
@@ -193,7 +193,7 @@ gh-monday sets `AMI_PASSTHROUGH=true` when running, so it works correctly throug
 
 The extension isn't installed. Run:
 ```bash
-gh extension install trieloff/gh-monday
+gh extension install ai-ecoverse/gh-monday
 ```
 
 ### `Could not determine GitHub username`
@@ -239,7 +239,7 @@ gh monday --no-cache
 
 ## 🤝 Contributing
 
-Contributions welcome! Please [open an issue](https://github.com/trieloff/gh-monday/issues) to discuss changes before submitting a PR.
+Contributions welcome! Please [open an issue](https://github.com/ai-ecoverse/gh-monday/issues) to discuss changes before submitting a PR.
 
 ## 📜 License
 
@@ -247,16 +247,16 @@ Apache 2.0
 
 ## 🔗 Related Projects
 
-Part of the **[AI Ecoverse](https://github.com/trieloff/ai-ecoverse)** — tools for AI-assisted development:
+Part of the **[AI Ecoverse](https://github.com/ai-ecoverse/.github)** — tools for AI-assisted development:
 
-- **[ai-aligned-gh](https://github.com/trieloff/ai-aligned-gh)** — GitHub CLI wrapper for AI attribution
-- **[ai-aligned-git](https://github.com/trieloff/ai-aligned-git)** — Git wrapper for safe AI commit practices
-- **[yolo](https://github.com/trieloff/yolo)** — AI CLI launcher with worktree isolation
-- **[am-i-ai](https://github.com/trieloff/am-i-ai)** — Shared AI detection library
-- **[as-a-bot](https://github.com/trieloff/as-a-bot)** — GitHub App token broker for proper AI attribution
-- **[vibe-coded-badge-action](https://github.com/trieloff/vibe-coded-badge-action)** — Badge showing AI-generated code percentage
-- **[gh-workflow-peek](https://github.com/trieloff/gh-workflow-peek)** — Smarter GitHub Actions log filtering
-- **[upskill](https://github.com/trieloff/upskill)** — Install Claude/Agent skills from other repositories
+- **[ai-aligned-gh](https://github.com/ai-ecoverse/ai-aligned-gh)** — GitHub CLI wrapper for AI attribution
+- **[ai-aligned-git](https://github.com/ai-ecoverse/ai-aligned-git)** — Git wrapper for safe AI commit practices
+- **[yolo](https://github.com/ai-ecoverse/yolo)** — AI CLI launcher with worktree isolation
+- **[am-i-ai](https://github.com/ai-ecoverse/am-i-ai)** — Shared AI detection library
+- **[as-a-bot](https://github.com/ai-ecoverse/as-a-bot)** — GitHub App token broker for proper AI attribution
+- **[vibe-coded-badge-action](https://github.com/ai-ecoverse/vibe-coded-badge-action)** — Badge showing AI-generated code percentage
+- **[gh-workflow-peek](https://github.com/ai-ecoverse/gh-workflow-peek)** — Smarter GitHub Actions log filtering
+- **[upskill](https://github.com/ai-ecoverse/gh-upskill)** — Install Claude/Agent skills from other repositories
 
 ---
 

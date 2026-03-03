@@ -125,7 +125,7 @@ gh monday --mark-done THREAD_ID1 THREAD_ID2 2>&1 | cat
 ```
 gh: "monday" is not a gh command.
 ```
-→ Suggest: `gh extension install trieloff/gh-monday`
+→ Suggest: `gh extension install ai-ecoverse/gh-monday`
 
 **Auth failure or gh not found:**
 ```
