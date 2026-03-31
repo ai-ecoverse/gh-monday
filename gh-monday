@@ -768,7 +768,7 @@ format_item() {
     printf "  ${DIM}%s${NC} ${BOLD}%s${NC} #%s%s%s\n" "$updated_date" "$repo" "$number" "$local_marker" "$draft_marker"
     printf "    %s\n" "$title"
     printf "    ${DIM}%s · %s · %s${NC}\n" "$type_icon" "$role_label" "$last_info"
-    printf "    %s\n" "$url"
+    printf "    \033]8;;%s\a%s\033]8;;\a\n" "$url" "$url"
 }
 
 # Render the action needed section
@@ -880,6 +880,17 @@ format_notification_reason() {
     esac
 }
 
+# Convert GitHub API subject URL to a web URL
+notification_web_url() {
+    local api_url="$1" repo="$2" number="$3"
+    [ -n "$number" ] || return 0
+    if [[ "$api_url" == */pulls/* ]]; then
+        echo "https://github.com/$repo/pull/$number"
+    else
+        echo "https://github.com/$repo/issues/$number"
+    fi
+}
+
 # Render the notifications section
 # Reads from CATEGORIZED_NOTIFICATIONS_FILE (TSV: tier, reason, repo, title, subject_type, thread_id, url, updated_at)
 # Cross-references with SCORED_ITEMS_FILE to deduplicate items already shown in ACTION NEEDED
@@ -929,7 +940,9 @@ render_notifications() {
         local reason_text
         reason_text="$(format_notification_reason "$reason")"
         local display_id="${number:+#$number}"
-        printf "    ${BOLD}%s${NC} %s — %s\n" "$repo" "$display_id" "$reason_text"
+        local web_url
+        web_url="$(notification_web_url "$url" "$repo" "$number")"
+        printf "    \033]8;;%s\a${BOLD}%s${NC} %s\033]8;;\a — %s\n" "$web_url" "$repo" "$display_id" "$reason_text"
         action_count=$((action_count + 1))
     done < "$CATEGORIZED_NOTIFICATIONS_FILE"
     if [ "$action_count" -gt 0 ]; then
@@ -952,7 +965,9 @@ render_notifications() {
         local reason_text
         reason_text="$(format_notification_reason "$reason")"
         local display_id="${number:+#$number}"
-        printf "    ${BOLD}%s${NC} %s — %s\n" "$repo" "$display_id" "$reason_text"
+        local web_url
+        web_url="$(notification_web_url "$url" "$repo" "$number")"
+        printf "    \033]8;;%s\a${BOLD}%s${NC} %s\033]8;;\a — %s\n" "$web_url" "$repo" "$display_id" "$reason_text"
         yours_count=$((yours_count + 1))
     done < "$CATEGORIZED_NOTIFICATIONS_FILE"
     if [ "$yours_count" -gt 0 ]; then
@@ -975,7 +990,9 @@ render_notifications() {
         local reason_text
         reason_text="$(format_notification_reason "$reason")"
         local display_id="${number:+#$number}"
-        printf "    ${BOLD}%s${NC} %s — %s\n" "$repo" "$display_id" "$reason_text"
+        local web_url
+        web_url="$(notification_web_url "$url" "$repo" "$number")"
+        printf "    \033]8;;%s\a${BOLD}%s${NC} %s\033]8;;\a — %s\n" "$web_url" "$repo" "$display_id" "$reason_text"
         state_count=$((state_count + 1))
     done < "$CATEGORIZED_NOTIFICATIONS_FILE"
     if [ "$state_count" -gt 0 ]; then
